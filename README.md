@@ -10,7 +10,7 @@ Name note: in Old English and related Germanic languages, *mund* relates to “p
 
 Private kickoff. Interface and behavior are stabilizing.
 
-Source of truth: `docs/spec.md`
+Source of truth: `SPEC.md`
 
 ## Quickstart
 
