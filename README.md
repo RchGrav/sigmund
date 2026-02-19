@@ -21,7 +21,7 @@ Source of truth: `docs/spec.md`
 ```bash
 make
 ./sigmund --help
-````
+```
 
 ### Usage
 
