@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build static binary for portable Linux distribution
+        run: |
+          make clean
+          make CC=gcc CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -O2 -static -s"
+      - name: Verify static build with full regression suite
+        run: make test
+      - name: Prepare release artifacts
+        run: |
+          mv sigmund sigmund-linux-x86_64
+          sha256sum sigmund-linux-x86_64 > sigmund-linux-x86_64.sha256
+      - name: Publish GitHub release with generated notes and artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            sigmund-linux-x86_64
+            sigmund-linux-x86_64.sha256

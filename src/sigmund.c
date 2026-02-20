@@ -101,13 +101,15 @@ static int mkdir_p0700(const char *dir) {
         path[i] = '\0';
         if (path[0] != '\0') {
             struct stat st;
+            bool created = false;
             if (stat(path, &st) != 0) {
                 if (mkdir(path, 0700) != 0 && errno != EEXIST) return -1;
+                created = true;
             } else if (!S_ISDIR(st.st_mode)) {
                 errno = ENOTDIR;
                 return -1;
             }
-            if (chmod(path, 0700) != 0) return -1;
+            if (created && chmod(path, 0700) != 0) return -1;
         }
         path[i] = saved;
     }
@@ -282,7 +284,7 @@ static int count_session_escapees(pid_t sid, pid_t expected_pgid) {
     DIR *d = opendir("/proc");
     if (!d) return -1;
     int count = 0;
-    struct dirent *e;
+    const struct dirent *e;
     while ((e = readdir(d))) {
         if (!isdigit((unsigned char)e->d_name[0])) continue;
         pid_t pid = (pid_t)strtol(e->d_name, NULL, 10);
@@ -410,7 +412,21 @@ static int json_get_str(const char *j, const char *k, char *out, size_t n) {
     v++;
     size_t i = 0;
     while (*v && *v != '"' && i + 1 < n) {
-        if (*v == '\\' && v[1]) v++;
+        if (*v == '\\' && v[1]) {
+            v++;
+            switch (*v) {
+                case 'n': out[i++] = '\n'; break;
+                case 't': out[i++] = '\t'; break;
+                case 'r': out[i++] = '\r'; break;
+                case 'b': out[i++] = '\b'; break;
+                case 'f': out[i++] = '\f'; break;
+                case '\\': out[i++] = '\\'; break;
+                case '"': out[i++] = '"'; break;
+                default: out[i++] = *v; break;
+            }
+            v++;
+            continue;
+        }
         out[i++] = *v++;
     }
     out[i] = '\0';
@@ -432,7 +448,23 @@ static int json_get_argv_display(const char *j, char *out, size_t n) {
         char arg[256];
         size_t ai = 0;
         while (*v && *v != '"') {
-            if (*v == '\\' && v[1]) v++;
+            if (*v == '\\' && v[1]) {
+                v++;
+                char c = *v;
+                switch (*v) {
+                    case 'n': c = '\n'; break;
+                    case 't': c = '\t'; break;
+                    case 'r': c = '\r'; break;
+                    case 'b': c = '\b'; break;
+                    case 'f': c = '\f'; break;
+                    case '\\': c = '\\'; break;
+                    case '"': c = '"'; break;
+                    default: break;
+                }
+                if (ai + 1 < sizeof(arg)) arg[ai++] = c;
+                v++;
+                continue;
+            }
             if (ai + 1 < sizeof(arg)) arg[ai++] = *v;
             v++;
         }
@@ -677,7 +709,7 @@ static int cmd_list(const char *dir) {
     char boot[128] = {0};
     get_boot_id(boot, sizeof(boot));
     printf("%-7s %-8s %-8s %-6s %-8s %s\n", "ID", "PID", "PGID", "AGE", "STATE", "CMD");
-    struct dirent *e;
+    const struct dirent *e;
     while ((e = readdir(d))) {
         if (!has_suffix(e->d_name, ".json")) continue;
         char path[1200];
@@ -705,7 +737,7 @@ static int cmd_prune(const char *dir) {
     if (!d) return 0;
     char boot[128] = {0};
     get_boot_id(boot, sizeof(boot));
-    struct dirent *e;
+    const struct dirent *e;
     while ((e = readdir(d))) {
         if (!has_suffix(e->d_name, ".json")) continue;
         char path[1200];
