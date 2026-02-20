@@ -1,3 +1,6 @@
+# Build output
+/sigmund
+
 # Prerequisites
 *.d
 
