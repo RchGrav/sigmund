@@ -44,22 +44,46 @@ typedef struct {
 
 typedef enum { STATE_RUNNING, STATE_DEAD, STATE_STALE, STATE_UNKNOWN } run_state_t;
 
-static void die(const char *fmt, ...) {
+static void die_errno(const char *fmt, ...) {
+    int e = errno;
     va_list ap;
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
-    fputc('\n', stderr);
+    fprintf(stderr, ": %s\n", strerror(e));
     exit(1);
 }
 
 static int mkdir_p0700(const char *dir) {
-    struct stat st;
-    if (stat(dir, &st) == 0) {
-        if (!S_ISDIR(st.st_mode)) return -1;
-        return chmod(dir, 0700);
+    char path[1200];
+    if (snprintf(path, sizeof(path), "%s", dir) >= (int)sizeof(path)) {
+        errno = ENAMETOOLONG;
+        return -1;
     }
-    return mkdir(dir, 0700);
+
+    size_t len = strlen(path);
+    if (len == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    for (size_t i = 1; i <= len; i++) {
+        if (path[i] != '/' && path[i] != '\0') continue;
+        char saved = path[i];
+        path[i] = '\0';
+        if (path[0] != '\0') {
+            struct stat st;
+            if (stat(path, &st) != 0) {
+                if (mkdir(path, 0700) != 0 && errno != EEXIST) return -1;
+            } else if (!S_ISDIR(st.st_mode)) {
+                errno = ENOTDIR;
+                return -1;
+            }
+            if (chmod(path, 0700) != 0) return -1;
+        }
+        path[i] = saved;
+    }
+    return 0;
 }
 
 static int read_file_trim(const char *path, char *buf, size_t n) {
@@ -120,11 +144,6 @@ static int ensure_storage(char *dir, size_t n, bool *persistent) {
         const char *home = getenv("HOME");
         if (!home || !*home) return -1;
         snprintf(dir, n, "%s/.local/state/sigmund", home);
-        char p1[1024], p2[1024];
-        snprintf(p1, sizeof(p1), "%s/.local", home);
-        snprintf(p2, sizeof(p2), "%s/.local/state", home);
-        mkdir_p0700(p1);
-        mkdir_p0700(p2);
     }
     if (mkdir_p0700(dir) != 0) return -1;
     *persistent = true;
@@ -185,9 +204,77 @@ static int write_record_atomic(const char *dir, const record_t *r, char *out_jso
     fclose(f);
     if (rename(tmp, fin) != 0) { unlink(tmp); return -1; }
     int dfd = open(dir, O_RDONLY | O_DIRECTORY);
-    if (dfd >= 0) { fsync(dfd); close(dfd); }
+    if (dfd < 0) return -1;
+    if (fsync(dfd) != 0) { close(dfd); return -1; }
+    close(dfd);
     if (out_json_path) snprintf(out_json_path, out_n, "%s", fin);
     return 0;
+}
+
+static int append_cmd_escaped(char *dst, size_t n, size_t *off, const char *arg) {
+    const char *sq = "'\\''";
+    if (*off + 1 >= n) return -1;
+    dst[(*off)++] = '\'';
+    for (; *arg; arg++) {
+        if (*arg == '\'') {
+            for (size_t j = 0; sq[j]; j++) {
+                if (*off + 1 >= n) return -1;
+                dst[(*off)++] = sq[j];
+            }
+        } else {
+            if (*off + 1 >= n) return -1;
+            dst[(*off)++] = *arg;
+        }
+    }
+    if (*off + 1 >= n) return -1;
+    dst[(*off)++] = '\'';
+    dst[*off] = '\0';
+    return 0;
+}
+
+static int count_session_escapees(pid_t sid, pid_t expected_pgid) {
+    DIR *d = opendir("/proc");
+    if (!d) return -1;
+    int count = 0;
+    struct dirent *e;
+    while ((e = readdir(d))) {
+        if (!isdigit((unsigned char)e->d_name[0])) continue;
+        pid_t pid = (pid_t)strtol(e->d_name, NULL, 10);
+        char path[128], buf[4096];
+        snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+        ssize_t nr = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (nr <= 0) continue;
+        buf[nr] = '\0';
+        char *rp = strrchr(buf, ')');
+        if (!rp) continue;
+        char *p = rp + 2;
+        char *save = NULL;
+        int idx = 0;
+        pid_t pgid = 0;
+        pid_t proc_sid = 0;
+        for (char *tok = strtok_r(p, " ", &save); tok; tok = strtok_r(NULL, " ", &save), idx++) {
+            if (idx == 2) pgid = (pid_t)strtol(tok, NULL, 10);
+            if (idx == 3) {
+                proc_sid = (pid_t)strtol(tok, NULL, 10);
+                break;
+            }
+        }
+        if (proc_sid == sid && pgid != expected_pgid) count++;
+    }
+    closedir(d);
+    return count;
+}
+
+static void report_session_escapees(const record_t *r) {
+    int escaped = count_session_escapees(r->sid, r->pgid);
+    if (escaped > 0) {
+        fprintf(stderr,
+                "sigmund: warning: %d process(es) escaped process-group %ld but remain in session %ld\n",
+                escaped, (long)r->pgid, (long)r->sid);
+    }
 }
 
 static int read_proc_stat_tokens(pid_t pid, char *state_out, uint64_t *starttime_out) {
@@ -383,9 +470,9 @@ static run_state_t eval_state(const record_t *r, const char *current_boot) {
 static int perform_start(int argc, char **argv) {
     char dir[1024], id[16], log_path[1200], boot_id[128] = {0};
     bool persistent = false;
-    if (ensure_storage(dir, sizeof(dir), &persistent) != 0) die("sigmund: failed to prepare storage");
-    if (persistent && get_boot_id(boot_id, sizeof(boot_id)) != 0) die("sigmund: failed to read boot_id");
-    if (gen_id(dir, id, sizeof(id)) != 0) die("sigmund: failed to generate id");
+    if (ensure_storage(dir, sizeof(dir), &persistent) != 0) die_errno("sigmund: failed to prepare storage");
+    if (persistent && get_boot_id(boot_id, sizeof(boot_id)) != 0) die_errno("sigmund: failed to read boot_id");
+    if (gen_id(dir, id, sizeof(id)) != 0) die_errno("sigmund: failed to generate id");
     snprintf(log_path, sizeof(log_path), "%s/%s.log", dir, id);
 
     int pipefd[2];
@@ -393,14 +480,14 @@ static int perform_start(int argc, char **argv) {
     if (pipe2(pipefd, O_CLOEXEC) != 0)
 #endif
     {
-        if (pipe(pipefd) != 0) die("sigmund: pipe failed: %s", strerror(errno));
+        if (pipe(pipefd) != 0) die_errno("sigmund: pipe failed");
         fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
         fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
     }
     bool interactive = isatty(STDOUT_FILENO) && isatty(STDERR_FILENO);
 
     pid_t pid = fork();
-    if (pid < 0) die("sigmund: fork failed: %s", strerror(errno));
+    if (pid < 0) die_errno("sigmund: fork failed");
     if (pid == 0) {
         close(pipefd[0]);
         if (setsid() < 0) { int e = errno; write_all(pipefd[1], &e, sizeof(e)); _exit(127); }
@@ -450,13 +537,16 @@ static int perform_start(int argc, char **argv) {
     read_proc_starttime(pid, &r.proc_starttime_ticks);
     read_proc_exe(pid, &r.exe_dev, &r.exe_ino);
     size_t off = 0;
+    r.cmdline[0] = '\0';
     for (int i = 0; i < argc; i++) {
-        size_t left = sizeof(r.cmdline) - off;
-        int w = snprintf(r.cmdline + off, left, "%s%s", i ? " " : "", argv[i]);
-        if (w < 0 || (size_t)w >= left) break;
-        off += (size_t)w;
+        if (i > 0) {
+            if (off + 1 >= sizeof(r.cmdline)) break;
+            r.cmdline[off++] = ' ';
+            r.cmdline[off] = '\0';
+        }
+        if (append_cmd_escaped(r.cmdline, sizeof(r.cmdline), &off, argv[i]) != 0) break;
     }
-    if (write_record_atomic(dir, &r, NULL, 0) != 0) die("sigmund: failed to write record");
+    if (write_record_atomic(dir, &r, NULL, 0) != 0) die_errno("sigmund: failed to write record");
 
     printf("sigmund: id=%s pid=%ld pgid=%ld sid=%ld\n", r.id, (long)r.pid, (long)r.pgid, (long)r.sid);
     if (r.has_log) printf("sigmund: log: %s\n", r.log_path);
@@ -489,7 +579,10 @@ static int do_signal_action(const char *dir, const char *id, int sig, bool grace
         int waited = 0;
         while (waited < STOP_TIMEOUT_MS) {
             int g = group_exists(r.pgid);
-            if (g == 0 || leader_zombie(r.pgid)) return 0;
+            if (g == 0 || leader_zombie(r.pgid)) {
+                report_session_escapees(&r);
+                return 0;
+            }
             struct timespec sl = {.tv_sec = 0, .tv_nsec = POLL_SLEEP_MS * 1000000L};
             nanosleep(&sl, NULL);
             waited += POLL_SLEEP_MS;
@@ -499,9 +592,13 @@ static int do_signal_action(const char *dir, const char *id, int sig, bool grace
             return 4;
         }
         int g = group_exists(r.pgid);
-        return g == 0 ? 0 : 4;
+        if (g == 0) {
+            report_session_escapees(&r);
+            return 0;
+        }
+        return 4;
     }
-
+    report_session_escapees(&r);
     return 0;
 }
 
@@ -580,7 +677,7 @@ int main(int argc, char **argv) {
 
     char dir[1024];
     bool persistent = false;
-    if (ensure_storage(dir, sizeof(dir), &persistent) != 0) die("sigmund: failed to init storage");
+    if (ensure_storage(dir, sizeof(dir), &persistent) != 0) die_errno("sigmund: failed to init storage");
 
     if (!strcmp(argv[1], "-l") || !strcmp(argv[1], "--list")) return cmd_list(dir);
     if (!strcmp(argv[1], "prune")) return cmd_prune(dir);
