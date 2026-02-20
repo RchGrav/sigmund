@@ -12,9 +12,11 @@ Many CI runners (like GitHub Actions or GitLab CI) and non-interactive job syste
 
 ## Why use `sigmund`?
 
-* **Better than `nohup &`:** Prevents orphan processes. `sigmund stop` kills the entire process group, ensuring child processes don't leak.
-* **Safer than bare `kill $PID`:** Immune to PID recycling. `sigmund` verifies `/proc/<pid>/stat` start times and `/proc/<pid>/exe` inodes before sending signals, so you never accidentally kill a system service days later.
+* **More complete than `setsid`:** While running `setsid cmd &` successfully escapes the CI runner's process group, it leaves you blind. You have to manually track PIDs, wire up log files, and you still suffer from the risk of PID recycling when you script the teardown. `sigmund` gives you the session isolation of `setsid` *plus* durable tracking and safe cleanup.
+* **Better than `nohup &`:** Prevents orphan processes. `sigmund stop` kills the entire process group, ensuring child processes don't leak into the background forever.
+* **Safer than bare `kill $PID`:** Immune to PID recycling. `sigmund` verifies `/proc/<pid>/stat` start times and `/proc/<pid>/exe` inodes before sending signals, so you never accidentally kill a critical system service days later.
 * **Lighter than `systemd-run` or `tmux`:** Zero dependencies, no background daemon, no D-Bus required. Just a single compiled C binary.
+
 
 ## Status
 Private kickoff. Interface and behavior are stabilizing. Source of truth: `docs/SPEC.md`
