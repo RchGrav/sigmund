@@ -54,12 +54,21 @@ static void die_errno(const char *fmt, ...) {
     exit(1);
 }
 
-static int mkdir_p0700(const char *dir) {
-    char path[1200];
-    if (snprintf(path, sizeof(path), "%s", dir) >= (int)sizeof(path)) {
+static int checked_snprintf(char *dst, size_t n, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsnprintf(dst, n, fmt, ap);
+    va_end(ap);
+    if (r < 0 || (size_t)r >= n) {
         errno = ENAMETOOLONG;
         return -1;
     }
+    return 0;
+}
+
+static int mkdir_p0700(const char *dir) {
+    char path[1200];
+    if (checked_snprintf(path, sizeof(path), "%s", dir) != 0) return -1;
 
     size_t len = strlen(path);
     if (len == 0) {
@@ -125,10 +134,7 @@ static int gen_id(const char *dir, char *out, size_t out_n) {
     for (int tries = 0; tries < 100; tries++) {
         if (rand_bytes(b, sizeof(b)) != 0) return -1;
         for (size_t i = 0; i < sizeof(b); i++) snprintf(out + i * 2, out_n - i * 2, "%02x", b[i]);
-        if (snprintf(path, sizeof(path), "%s/%s.json", dir, out) >= (int)sizeof(path)) {
-            errno = ENAMETOOLONG;
-            return -1;
-        }
+        if (checked_snprintf(path, sizeof(path), "%s/%s.json", dir, out) != 0) return -1;
         if (access(path, F_OK) != 0) return 0;
     }
     return -1;
@@ -137,25 +143,16 @@ static int gen_id(const char *dir, char *out, size_t out_n) {
 static int ensure_storage(char *dir, size_t n, bool *persistent) {
     const char *xdg_runtime = getenv("XDG_RUNTIME_DIR");
     if (xdg_runtime && *xdg_runtime) {
-        if (snprintf(dir, n, "%s/sigmund", xdg_runtime) >= (int)n) {
-            errno = ENAMETOOLONG;
-            return -1;
-        }
+        if (checked_snprintf(dir, n, "%s/sigmund", xdg_runtime) != 0) return -1;
         if (mkdir_p0700(dir) == 0) { *persistent = false; return 0; }
     }
     const char *xdg_state = getenv("XDG_STATE_HOME");
     if (xdg_state && *xdg_state) {
-        if (snprintf(dir, n, "%s/sigmund", xdg_state) >= (int)n) {
-            errno = ENAMETOOLONG;
-            return -1;
-        }
+        if (checked_snprintf(dir, n, "%s/sigmund", xdg_state) != 0) return -1;
     } else {
         const char *home = getenv("HOME");
         if (!home || !*home) return -1;
-        if (snprintf(dir, n, "%s/.local/state/sigmund", home) >= (int)n) {
-            errno = ENAMETOOLONG;
-            return -1;
-        }
+        if (checked_snprintf(dir, n, "%s/.local/state/sigmund", home) != 0) return -1;
     }
     if (mkdir_p0700(dir) != 0) return -1;
     *persistent = true;
@@ -179,7 +176,12 @@ static int write_all(int fd, const void *buf, size_t n) {
 static void json_escape(FILE *f, const char *s) {
     for (; *s; s++) {
         if (*s == '"' || *s == '\\') fprintf(f, "\\%c", *s);
-        else if ((unsigned char)*s < 32) fprintf(f, " ");
+        else if (*s == '\n') fputs("\\n", f);
+        else if (*s == '\r') fputs("\\r", f);
+        else if (*s == '\t') fputs("\\t", f);
+        else if (*s == '\b') fputs("\\b", f);
+        else if (*s == '\f') fputs("\\f", f);
+        else if ((unsigned char)*s < 32) fprintf(f, "\\u%04x", (unsigned char)*s);
         else fputc(*s, f);
     }
 }
@@ -198,14 +200,8 @@ static int write_json_argv(FILE *f, int argc, char **argv) {
 
 static int write_record_atomic(const char *dir, const record_t *r, int argc, char **argv, char *out_json_path, size_t out_n) {
     char tmp[1200], fin[1200];
-    if (snprintf(fin, sizeof(fin), "%s/%s.json", dir, r->id) >= (int)sizeof(fin)) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-    if (snprintf(tmp, sizeof(tmp), "%s/.%s.tmp.%ld", dir, r->id, (long)getpid()) >= (int)sizeof(tmp)) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
+    if (checked_snprintf(fin, sizeof(fin), "%s/%s.json", dir, r->id) != 0) return -1;
+    if (checked_snprintf(tmp, sizeof(tmp), "%s/.%s.tmp.%ld", dir, r->id, (long)getpid()) != 0) return -1;
 
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return -1;
@@ -238,7 +234,7 @@ static int write_record_atomic(const char *dir, const record_t *r, int argc, cha
     if (dfd < 0) return -1;
     if (fsync(dfd) != 0) { close(dfd); return -1; }
     close(dfd);
-    if (out_json_path) snprintf(out_json_path, out_n, "%s", fin);
+    if (out_json_path && checked_snprintf(out_json_path, out_n, "%s", fin) != 0) return -1;
     return 0;
 }
 
@@ -272,7 +268,7 @@ static int count_session_escapees(pid_t sid, pid_t expected_pgid) {
         if (!isdigit((unsigned char)e->d_name[0])) continue;
         pid_t pid = (pid_t)strtol(e->d_name, NULL, 10);
         char path[128], buf[4096];
-        snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
+        if (checked_snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid) != 0) continue;
         int fd = open(path, O_RDONLY);
         if (fd < 0) continue;
         ssize_t nr = read(fd, buf, sizeof(buf) - 1);
@@ -310,7 +306,7 @@ static void report_session_escapees(const record_t *r) {
 
 static int read_proc_stat_tokens(pid_t pid, char *state_out, uint64_t *starttime_out) {
     char path[128], buf[4096];
-    snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
+    if (checked_snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid) != 0) return -1;
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
     ssize_t n = read(fd, buf, sizeof(buf)-1);
@@ -338,7 +334,7 @@ static int read_proc_stat_tokens(pid_t pid, char *state_out, uint64_t *starttime
 static int read_proc_exe(pid_t pid, uint64_t *dev, uint64_t *ino) {
     char path[128];
     struct stat st;
-    snprintf(path, sizeof(path), "/proc/%ld/exe", (long)pid);
+    if (checked_snprintf(path, sizeof(path), "/proc/%ld/exe", (long)pid) != 0) return -1;
     if (stat(path, &st) != 0) return -1;
     *dev = (uint64_t)st.st_dev;
     *ino = (uint64_t)st.st_ino;
@@ -348,7 +344,7 @@ static int read_proc_exe(pid_t pid, uint64_t *dev, uint64_t *ino) {
 static bool leader_present(pid_t pid) {
     char path[128];
     struct stat st;
-    snprintf(path, sizeof(path), "/proc/%ld", (long)pid);
+    if (checked_snprintf(path, sizeof(path), "/proc/%ld", (long)pid) != 0) return false;
     if (stat(path, &st) == 0) {
         char stc = 0;
         if (read_proc_stat_tokens(pid, &stc, NULL) == 0 && stc == 'Z') return false;
@@ -366,12 +362,10 @@ static int group_exists(pid_t pgid) {
 
 static int json_find_key(const char *j, const char *k, const char **v) {
     char pat[64];
-    snprintf(pat, sizeof(pat), "\"%s\"", k);
+    if (checked_snprintf(pat, sizeof(pat), "\n  \"%s\":", k) != 0) return -1;
     const char *p = strstr(j, pat);
     if (!p) return -1;
-    p = strchr(p, ':');
-    if (!p) return -1;
-    p++;
+    p += strlen(pat);
     while (*p && isspace((unsigned char)*p)) p++;
     *v = p;
     return 0;
@@ -500,10 +494,7 @@ static int perform_start(int argc, char **argv) {
     if (ensure_storage(dir, sizeof(dir), &persistent) != 0) die_errno("sigmund: failed to prepare storage");
     if (persistent && get_boot_id(boot_id, sizeof(boot_id)) != 0) die_errno("sigmund: failed to read boot_id");
     if (gen_id(dir, id, sizeof(id)) != 0) die_errno("sigmund: failed to generate id");
-    if (snprintf(log_path, sizeof(log_path), "%s/%s.log", dir, id) >= (int)sizeof(log_path)) {
-        errno = ENAMETOOLONG;
-        die_errno("sigmund: log path too long");
-    }
+    if (checked_snprintf(log_path, sizeof(log_path), "%s/%s.log", dir, id) != 0) die_errno("sigmund: log path too long");
 
     int pipefd[2];
 #ifdef O_CLOEXEC
@@ -584,10 +575,7 @@ static int perform_start(int argc, char **argv) {
 }
 
 static int load_record_by_id(const char *dir, const char *id, record_t *r, char *path, size_t n) {
-    if (snprintf(path, n, "%s/%s.json", dir, id) >= (int)n) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
+    if (checked_snprintf(path, n, "%s/%s.json", dir, id) != 0) return -1;
     if (access(path, F_OK) != 0) return -1;
     return load_record(path, r);
 }
@@ -664,7 +652,7 @@ static int cmd_list(const char *dir) {
     while ((e = readdir(d))) {
         if (!strstr(e->d_name, ".json")) continue;
         char path[1200];
-        if (snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >= (int)sizeof(path)) continue;
+        if (checked_snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) != 0) continue;
         record_t r;
         if (load_record(path, &r) != 0) continue;
         run_state_t st = eval_state(&r, r.has_boot ? boot : NULL);
@@ -688,7 +676,7 @@ static int cmd_prune(const char *dir) {
     while ((e = readdir(d))) {
         if (!strstr(e->d_name, ".json")) continue;
         char path[1200];
-        if (snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >= (int)sizeof(path)) continue;
+        if (checked_snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) != 0) continue;
         record_t r;
         if (load_record(path, &r) != 0) continue;
         if (eval_state(&r, r.has_boot ? boot : NULL) == STATE_DEAD) {
