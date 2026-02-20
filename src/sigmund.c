@@ -24,7 +24,7 @@
 #define POLL_SLEEP_MS 25
 #define SIGMUND_VERSION "0.1.0"
 
-typedef struct {
+struct record {
     int version;
     char id[16];
     pid_t pid;
@@ -41,17 +41,13 @@ typedef struct {
     char cmdline[1024];
     bool has_log;
     bool has_boot;
-} record_t;
+};
 
-typedef enum { STATE_RUNNING, STATE_DEAD, STATE_STALE, STATE_UNKNOWN } run_state_t;
+enum run_state { STATE_RUNNING, STATE_DEAD, STATE_STALE, STATE_UNKNOWN };
 
-static void die_errno(const char *fmt, ...) {
+static void die_errno(const char *msg) {
     int e = errno;
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    va_end(ap);
-    fprintf(stderr, ": %s\n", strerror(e));
+    fprintf(stderr, "%s: %s\n", msg, strerror(e));
     exit(1);
 }
 
@@ -74,20 +70,26 @@ static bool has_suffix(const char *s, const char *suffix) {
 
 static bool valid_id(const char *id) {
     size_t len = strlen(id);
-    if (len < 6 || len > 10) return false;
+    if (len < 6 || len > 10) {
+        return false;
+    }
     for (size_t i = 0; i < len; i++) {
-        if (!isdigit((unsigned char)id[i]) && !(id[i] >= 'a' && id[i] <= 'f')) return false;
+        if (!isdigit((unsigned char)id[i]) && !(id[i] >= 'a' && id[i] <= 'f')) {
+            return false;
+        }
     }
     return true;
 }
 
-static bool valid_record(const record_t *r) {
+static bool valid_record(const struct record *r) {
     return r->pid > 0 && r->pgid > 1 && r->id[0] != '\0';
 }
 
 static int mkdir_p0700(const char *dir) {
     char path[1200];
-    if (checked_snprintf(path, sizeof(path), "%s", dir) != 0) return -1;
+    if (checked_snprintf(path, sizeof(path), "%s", dir) != 0) {
+        return -1;
+    }
 
     size_t len = strlen(path);
     if (len == 0) {
@@ -96,20 +98,26 @@ static int mkdir_p0700(const char *dir) {
     }
 
     for (size_t i = 1; i <= len; i++) {
-        if (path[i] != '/' && path[i] != '\0') continue;
+        if (path[i] != '/' && path[i] != '\0') {
+            continue;
+        }
         char saved = path[i];
         path[i] = '\0';
         if (path[0] != '\0') {
             struct stat st;
             bool created = false;
             if (stat(path, &st) != 0) {
-                if (mkdir(path, 0700) != 0 && errno != EEXIST) return -1;
+                if (mkdir(path, 0700) != 0 && errno != EEXIST) {
+                    return -1;
+                }
                 created = true;
             } else if (!S_ISDIR(st.st_mode)) {
                 errno = ENOTDIR;
                 return -1;
             }
-            if (created && chmod(path, 0700) != 0) return -1;
+            if (created && chmod(path, 0700) != 0) {
+                return -1;
+            }
         }
         path[i] = saved;
     }
@@ -118,10 +126,14 @@ static int mkdir_p0700(const char *dir) {
 
 static int read_file_trim(const char *path, char *buf, size_t n) {
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        return -1;
+    }
     ssize_t r = read(fd, buf, n - 1);
     close(fd);
-    if (r < 0) return -1;
+    if (r < 0) {
+        return -1;
+    }
     buf[r] = '\0';
     while (r > 0 && (buf[r - 1] == '\n' || buf[r - 1] == '\r' || isspace((unsigned char)buf[r - 1]))) {
         buf[r - 1] = '\0';
@@ -136,13 +148,20 @@ static int get_boot_id(char *buf, size_t n) {
 
 static int rand_bytes(uint8_t *buf, size_t n) {
     ssize_t r = getrandom(buf, n, 0);
-    if (r == (ssize_t)n) return 0;
+    if (r == (ssize_t)n) {
+        return 0;
+    }
     int fd = open("/dev/urandom", O_RDONLY);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        return -1;
+    }
     size_t off = 0;
     while (off < n) {
         ssize_t x = read(fd, buf + off, n - off);
-        if (x <= 0) { close(fd); return -1; }
+        if (x <= 0) {
+            close(fd);
+            return -1;
+        }
         off += (size_t)x;
     }
     close(fd);
@@ -153,10 +172,18 @@ static int gen_id(const char *dir, char *out, size_t out_n) {
     uint8_t b[ID_HEX_LEN / 2];
     char path[1200];
     for (int tries = 0; tries < 100; tries++) {
-        if (rand_bytes(b, sizeof(b)) != 0) return -1;
-        for (size_t i = 0; i < sizeof(b); i++) snprintf(out + i * 2, out_n - i * 2, "%02x", b[i]);
-        if (checked_snprintf(path, sizeof(path), "%s/%s.json", dir, out) != 0) return -1;
-        if (access(path, F_OK) != 0) return 0;
+        if (rand_bytes(b, sizeof(b)) != 0) {
+            return -1;
+        }
+        for (size_t i = 0; i < sizeof(b); i++) {
+            snprintf(out + i * 2, out_n - i * 2, "%02x", b[i]);
+        }
+        if (checked_snprintf(path, sizeof(path), "%s/%s.json", dir, out) != 0) {
+            return -1;
+        }
+        if (access(path, F_OK) != 0) {
+            return 0;
+        }
     }
     return -1;
 }
@@ -164,18 +191,31 @@ static int gen_id(const char *dir, char *out, size_t out_n) {
 static int ensure_storage(char *dir, size_t n, bool *persistent) {
     const char *xdg_runtime = getenv("XDG_RUNTIME_DIR");
     if (xdg_runtime && *xdg_runtime) {
-        if (checked_snprintf(dir, n, "%s/sigmund", xdg_runtime) != 0) return -1;
-        if (mkdir_p0700(dir) == 0) { *persistent = false; return 0; }
+        if (checked_snprintf(dir, n, "%s/sigmund", xdg_runtime) != 0) {
+            return -1;
+        }
+        if (mkdir_p0700(dir) == 0) {
+            *persistent = false;
+            return 0;
+        }
     }
     const char *xdg_state = getenv("XDG_STATE_HOME");
     if (xdg_state && *xdg_state) {
-        if (checked_snprintf(dir, n, "%s/sigmund", xdg_state) != 0) return -1;
+        if (checked_snprintf(dir, n, "%s/sigmund", xdg_state) != 0) {
+            return -1;
+        }
     } else {
         const char *home = getenv("HOME");
-        if (!home || !*home) return -1;
-        if (checked_snprintf(dir, n, "%s/.local/state/sigmund", home) != 0) return -1;
+        if (!home || !*home) {
+            return -1;
+        }
+        if (checked_snprintf(dir, n, "%s/.local/state/sigmund", home) != 0) {
+            return -1;
+        }
     }
-    if (mkdir_p0700(dir) != 0) return -1;
+    if (mkdir_p0700(dir) != 0) {
+        return -1;
+    }
     *persistent = true;
     return 0;
 }
@@ -185,7 +225,9 @@ static int write_all(int fd, const void *buf, size_t n) {
     while (n > 0) {
         ssize_t w = write(fd, p, n);
         if (w < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR) {
+                continue;
+            }
             return -1;
         }
         p += w;
@@ -196,21 +238,32 @@ static int write_all(int fd, const void *buf, size_t n) {
 
 static void json_escape(FILE *f, const char *s) {
     for (; *s; s++) {
-        if (*s == '"' || *s == '\\') fprintf(f, "\\%c", *s);
-        else if (*s == '\n') fputs("\\n", f);
-        else if (*s == '\r') fputs("\\r", f);
-        else if (*s == '\t') fputs("\\t", f);
-        else if (*s == '\b') fputs("\\b", f);
-        else if (*s == '\f') fputs("\\f", f);
-        else if ((unsigned char)*s < 32) fprintf(f, "\\u%04x", (unsigned char)*s);
-        else fputc(*s, f);
+        if (*s == '"' || *s == '\\') {
+            fprintf(f, "\\%c", *s);
+        } else if (*s == '\n') {
+            fputs("\\n", f);
+        } else if (*s == '\r') {
+            fputs("\\r", f);
+        } else if (*s == '\t') {
+            fputs("\\t", f);
+        } else if (*s == '\b') {
+            fputs("\\b", f);
+        } else if (*s == '\f') {
+            fputs("\\f", f);
+        } else if ((unsigned char)*s < 32) {
+            fprintf(f, "\\u%04x", (unsigned char)*s);
+        } else {
+            fputc(*s, f);
+        }
     }
 }
 
 static int write_json_argv(FILE *f, int argc, char **argv) {
     fputs("[", f);
     for (int i = 0; i < argc; i++) {
-        if (i > 0) fputs(", ", f);
+        if (i > 0) {
+            fputs(", ", f);
+        }
         fputc('"', f);
         json_escape(f, argv[i]);
         fputc('"', f);
@@ -219,62 +272,107 @@ static int write_json_argv(FILE *f, int argc, char **argv) {
     return 0;
 }
 
-static int write_record_atomic(const char *dir, const record_t *r, int argc, char **argv, char *out_json_path, size_t out_n) {
+static int write_record_atomic(const char *dir, const struct record *r, int argc, char **argv, char *out_json_path, size_t out_n) {
     char tmp[1200], fin[1200];
-    if (checked_snprintf(fin, sizeof(fin), "%s/%s.json", dir, r->id) != 0) return -1;
-    if (checked_snprintf(tmp, sizeof(tmp), "%s/.%s.tmp.%ld", dir, r->id, (long)getpid()) != 0) return -1;
+    if (checked_snprintf(fin, sizeof(fin), "%s/%s.json", dir, r->id) != 0) {
+        return -1;
+    }
+    if (checked_snprintf(tmp, sizeof(tmp), "%s/.%s.tmp.%ld", dir, r->id, (long)getpid()) != 0) {
+        return -1;
+    }
 
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        return -1;
+    }
     FILE *f = fdopen(fd, "w");
-    if (!f) { close(fd); return -1; }
+    if (!f) {
+        close(fd);
+        return -1;
+    }
 
     fprintf(f, "{\n");
     fprintf(f, "  \"version\": %d,\n", r->version);
-    fprintf(f, "  \"id\": \""); json_escape(f, r->id); fprintf(f, "\",\n");
+    fprintf(f, "  \"id\": \"");
+    json_escape(f, r->id);
+    fprintf(f, "\",\n");
     fprintf(f, "  \"pid\": %ld,\n", (long)r->pid);
     fprintf(f, "  \"pgid\": %ld,\n", (long)r->pgid);
     fprintf(f, "  \"sid\": %ld,\n", (long)r->sid);
     fprintf(f, "  \"start_unix_ns\": %" PRId64 ",\n", r->start_unix_ns);
-    fprintf(f, "  \"argv\": "); write_json_argv(f, argc, argv); fprintf(f, ",\n");
-    fprintf(f, "  \"cmdline_display\": \""); json_escape(f, r->cmdline); fprintf(f, "\",\n");
+    fprintf(f, "  \"argv\": ");
+    write_json_argv(f, argc, argv);
+    fprintf(f, ",\n");
+    fprintf(f, "  \"cmdline_display\": \"");
+    json_escape(f, r->cmdline);
+    fprintf(f, "\",\n");
     fprintf(f, "  \"uid\": %u,\n", r->uid);
     fprintf(f, "  \"gid\": %u,\n", r->gid);
-    if (r->has_log) { fprintf(f, "  \"log_path\": \""); json_escape(f, r->log_path); fprintf(f, "\",\n"); }
-    if (r->has_boot) { fprintf(f, "  \"boot_id\": \""); json_escape(f, r->boot_id); fprintf(f, "\",\n"); }
+    if (r->has_log) {
+        fprintf(f, "  \"log_path\": \"");
+        json_escape(f, r->log_path);
+        fprintf(f, "\",\n");
+    }
+    if (r->has_boot) {
+        fprintf(f, "  \"boot_id\": \"");
+        json_escape(f, r->boot_id);
+        fprintf(f, "\",\n");
+    }
     fprintf(f, "  \"proc_starttime_ticks\": %" PRIu64 ",\n", r->proc_starttime_ticks);
     fprintf(f, "  \"exe_dev\": %" PRIu64 ",\n", r->exe_dev);
     fprintf(f, "  \"exe_ino\": %" PRIu64 "\n", r->exe_ino);
     fprintf(f, "}\n");
 
     fflush(f);
-    if (fsync(fd) != 0) { fclose(f); unlink(tmp); return -1; }
+    if (fsync(fd) != 0) {
+        fclose(f);
+        unlink(tmp);
+        return -1;
+    }
     fclose(f);
-    if (rename(tmp, fin) != 0) { unlink(tmp); return -1; }
+    if (rename(tmp, fin) != 0) {
+        unlink(tmp);
+        return -1;
+    }
     int dfd = open(dir, O_RDONLY | O_DIRECTORY);
-    if (dfd < 0) return -1;
-    if (fsync(dfd) != 0) { close(dfd); return -1; }
+    if (dfd < 0) {
+        return -1;
+    }
+    if (fsync(dfd) != 0) {
+        close(dfd);
+        return -1;
+    }
     close(dfd);
-    if (out_json_path && checked_snprintf(out_json_path, out_n, "%s", fin) != 0) return -1;
+    if (out_json_path && checked_snprintf(out_json_path, out_n, "%s", fin) != 0) {
+        return -1;
+    }
     return 0;
 }
 
 static int append_cmd_escaped(char *dst, size_t n, size_t *off, const char *arg) {
     const char *sq = "'\\''";
-    if (*off + 1 >= n) return -1;
+    if (*off + 1 >= n) {
+        return -1;
+    }
     dst[(*off)++] = '\'';
     for (; *arg; arg++) {
         if (*arg == '\'') {
             for (size_t j = 0; sq[j]; j++) {
-                if (*off + 1 >= n) return -1;
+                if (*off + 1 >= n) {
+                    return -1;
+                }
                 dst[(*off)++] = sq[j];
             }
         } else {
-            if (*off + 1 >= n) return -1;
+            if (*off + 1 >= n) {
+                return -1;
+            }
             dst[(*off)++] = *arg;
         }
     }
-    if (*off + 1 >= n) return -1;
+    if (*off + 1 >= n) {
+        return -1;
+    }
     dst[(*off)++] = '\'';
     dst[*off] = '\0';
     return 0;
@@ -282,41 +380,75 @@ static int append_cmd_escaped(char *dst, size_t n, size_t *off, const char *arg)
 
 static int count_session_escapees(pid_t sid, pid_t expected_pgid) {
     DIR *d = opendir("/proc");
-    if (!d) return -1;
+    if (!d) {
+        return -1;
+    }
     int count = 0;
     const struct dirent *e;
     while ((e = readdir(d))) {
-        if (!isdigit((unsigned char)e->d_name[0])) continue;
-        pid_t pid = (pid_t)strtol(e->d_name, NULL, 10);
+        if (!isdigit((unsigned char)e->d_name[0])) {
+            continue;
+        }
+        char *pid_end = NULL;
+        errno = 0;
+        long pid_long = strtol(e->d_name, &pid_end, 10);
+        if (pid_end == e->d_name || *pid_end != '\0' || errno != 0) {
+            continue;
+        }
+        pid_t pid = (pid_t)pid_long;
         char path[128], buf[4096];
-        if (checked_snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid) != 0) continue;
+        if (checked_snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid) != 0) {
+            continue;
+        }
         int fd = open(path, O_RDONLY);
-        if (fd < 0) continue;
+        if (fd < 0) {
+            continue;
+        }
         ssize_t nr = read(fd, buf, sizeof(buf) - 1);
         close(fd);
-        if (nr <= 0) continue;
+        if (nr <= 0) {
+            continue;
+        }
         buf[nr] = '\0';
         char *rp = strrchr(buf, ')');
-        if (!rp) continue;
+        if (!rp) {
+            continue;
+        }
         char *p = rp + 2;
         char *save = NULL;
         int idx = 0;
         pid_t pgid = 0;
         pid_t proc_sid = 0;
         for (char *tok = strtok_r(p, " ", &save); tok; tok = strtok_r(NULL, " ", &save), idx++) {
-            if (idx == 2) pgid = (pid_t)strtol(tok, NULL, 10);
+            if (idx == 2) {
+                char *end = NULL;
+                errno = 0;
+                long pgid_long = strtol(tok, &end, 10);
+                if (end == tok || errno != 0) {
+                    continue;
+                }
+                pgid = (pid_t)pgid_long;
+            }
             if (idx == 3) {
-                proc_sid = (pid_t)strtol(tok, NULL, 10);
+                char *end = NULL;
+                errno = 0;
+                long sid_long = strtol(tok, &end, 10);
+                if (end == tok || errno != 0) {
+                    continue;
+                }
+                proc_sid = (pid_t)sid_long;
                 break;
             }
         }
-        if (proc_sid == sid && pgid != expected_pgid) count++;
+        if (proc_sid == sid && pgid != expected_pgid) {
+            count++;
+        }
     }
     closedir(d);
     return count;
 }
 
-static void report_session_escapees(const record_t *r) {
+static void report_session_escapees(const struct record *r) {
     int escaped = count_session_escapees(r->sid, r->pgid);
     if (escaped > 0) {
         fprintf(stderr,
@@ -327,25 +459,42 @@ static void report_session_escapees(const record_t *r) {
 
 static int read_proc_stat_tokens(pid_t pid, char *state_out, uint64_t *starttime_out) {
     char path[128], buf[4096];
-    if (checked_snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid) != 0) return -1;
+    if (checked_snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid) != 0) {
+        return -1;
+    }
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return -1;
-    ssize_t n = read(fd, buf, sizeof(buf)-1);
+    if (fd < 0) {
+        return -1;
+    }
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
-    if (n <= 0) return -1;
+    if (n <= 0) {
+        return -1;
+    }
     buf[n] = '\0';
     char *rp = strrchr(buf, ')');
-    if (!rp) return -1;
+    if (!rp) {
+        return -1;
+    }
     char *p = rp + 2;
     int idx = 0;
     char *save = NULL;
     bool got_state = false;
     for (char *tok = strtok_r(p, " ", &save); tok; tok = strtok_r(NULL, " ", &save), idx++) {
-        if (idx == 0 && state_out) { *state_out = tok[0]; got_state = true; }
+        if (idx == 0 && state_out) {
+            *state_out = tok[0];
+            got_state = true;
+        }
         /* /proc/<pid>/stat starttime is field 22 (1-indexed overall),
          * which is index 19 after the trailing ')' where idx 0 starts at state. */
         if (idx == 19 && starttime_out) {
-            *starttime_out = strtoull(tok, NULL, 10);
+            char *end = NULL;
+            errno = 0;
+            unsigned long long parsed = strtoull(tok, &end, 10);
+            if (end == tok || errno != 0) {
+                return -1;
+            }
+            *starttime_out = parsed;
             return 0;
         }
     }
@@ -355,8 +504,12 @@ static int read_proc_stat_tokens(pid_t pid, char *state_out, uint64_t *starttime
 static int read_proc_exe(pid_t pid, uint64_t *dev, uint64_t *ino) {
     char path[128];
     struct stat st;
-    if (checked_snprintf(path, sizeof(path), "/proc/%ld/exe", (long)pid) != 0) return -1;
-    if (stat(path, &st) != 0) return -1;
+    if (checked_snprintf(path, sizeof(path), "/proc/%ld/exe", (long)pid) != 0) {
+        return -1;
+    }
+    if (stat(path, &st) != 0) {
+        return -1;
+    }
     *dev = (uint64_t)st.st_dev;
     *ino = (uint64_t)st.st_ino;
     return 0;
@@ -365,64 +518,102 @@ static int read_proc_exe(pid_t pid, uint64_t *dev, uint64_t *ino) {
 static bool leader_present(pid_t pid) {
     char path[128];
     struct stat st;
-    if (checked_snprintf(path, sizeof(path), "/proc/%ld", (long)pid) != 0) return false;
+    if (checked_snprintf(path, sizeof(path), "/proc/%ld", (long)pid) != 0) {
+        return false;
+    }
     if (stat(path, &st) == 0) {
         char stc = 0;
-        if (read_proc_stat_tokens(pid, &stc, NULL) == 0 && stc == 'Z') return false;
+        if (read_proc_stat_tokens(pid, &stc, NULL) == 0 && stc == 'Z') {
+            return false;
+        }
         return true;
     }
-    if (kill(pid, 0) == 0 || errno == EPERM) return true;
+    if (kill(pid, 0) == 0 || errno == EPERM) {
+        return true;
+    }
     return false;
 }
 
 static int group_exists(pid_t pgid) {
-    if (kill(-pgid, 0) == 0 || errno == EPERM) return 1;
-    if (errno == ESRCH) return 0;
+    if (kill(-pgid, 0) == 0 || errno == EPERM) {
+        return 1;
+    }
+    if (errno == ESRCH) {
+        return 0;
+    }
     return -1;
 }
 
 static int json_find_key(const char *j, const char *k, const char **v) {
     char pat[64];
-    if (checked_snprintf(pat, sizeof(pat), "\n  \"%s\":", k) != 0) return -1;
+    if (checked_snprintf(pat, sizeof(pat), "\n  \"%s\":", k) != 0) {
+        return -1;
+    }
     const char *p = strstr(j, pat);
-    if (!p) return -1;
+    if (!p) {
+        return -1;
+    }
     p += strlen(pat);
-    while (*p && isspace((unsigned char)*p)) p++;
+    while (*p && isspace((unsigned char)*p)) {
+        p++;
+    }
     *v = p;
     return 0;
 }
 
 static int json_get_i64(const char *j, const char *k, int64_t *out) {
     const char *v;
-    if (json_find_key(j, k, &v) != 0) return -1;
+    if (json_find_key(j, k, &v) != 0) {
+        return -1;
+    }
     *out = strtoll(v, NULL, 10);
     return 0;
 }
 
 static int json_get_u64(const char *j, const char *k, uint64_t *out) {
     const char *v;
-    if (json_find_key(j, k, &v) != 0) return -1;
+    if (json_find_key(j, k, &v) != 0) {
+        return -1;
+    }
     *out = strtoull(v, NULL, 10);
     return 0;
 }
 
 static int json_get_str(const char *j, const char *k, char *out, size_t n) {
     const char *v;
-    if (json_find_key(j, k, &v) != 0 || *v != '"') return -1;
+    if (json_find_key(j, k, &v) != 0 || *v != '"') {
+        return -1;
+    }
     v++;
     size_t i = 0;
     while (*v && *v != '"' && i + 1 < n) {
         if (*v == '\\' && v[1]) {
             v++;
             switch (*v) {
-                case 'n': out[i++] = '\n'; break;
-                case 't': out[i++] = '\t'; break;
-                case 'r': out[i++] = '\r'; break;
-                case 'b': out[i++] = '\b'; break;
-                case 'f': out[i++] = '\f'; break;
-                case '\\': out[i++] = '\\'; break;
-                case '"': out[i++] = '"'; break;
-                default: out[i++] = *v; break;
+            case 'n':
+                out[i++] = '\n';
+                break;
+            case 't':
+                out[i++] = '\t';
+                break;
+            case 'r':
+                out[i++] = '\r';
+                break;
+            case 'b':
+                out[i++] = '\b';
+                break;
+            case 'f':
+                out[i++] = '\f';
+                break;
+            case '\\':
+                out[i++] = '\\';
+                break;
+            case '"':
+                out[i++] = '"';
+                break;
+            default:
+                out[i++] = *v;
+                break;
             }
             v++;
             continue;
@@ -435,15 +626,26 @@ static int json_get_str(const char *j, const char *k, char *out, size_t n) {
 
 static int json_get_argv_display(const char *j, char *out, size_t n) {
     const char *v;
-    if (json_find_key(j, "argv", &v) != 0 || *v != '[') return -1;
+    if (json_find_key(j, "argv", &v) != 0 || *v != '[') {
+        return -1;
+    }
     v++;
     size_t off = 0;
     bool first = true;
     while (*v) {
-        while (*v && isspace((unsigned char)*v)) v++;
-        if (*v == ']') break;
-        if (*v == ',') { v++; continue; }
-        if (*v != '"') return -1;
+        while (*v && isspace((unsigned char)*v)) {
+            v++;
+        }
+        if (*v == ']') {
+            break;
+        }
+        if (*v == ',') {
+            v++;
+            continue;
+        }
+        if (*v != '"') {
+            return -1;
+        }
         v++;
         char arg[256];
         size_t ai = 0;
@@ -452,60 +654,106 @@ static int json_get_argv_display(const char *j, char *out, size_t n) {
                 v++;
                 char c = *v;
                 switch (*v) {
-                    case 'n': c = '\n'; break;
-                    case 't': c = '\t'; break;
-                    case 'r': c = '\r'; break;
-                    case 'b': c = '\b'; break;
-                    case 'f': c = '\f'; break;
-                    case '\\': c = '\\'; break;
-                    case '"': c = '"'; break;
-                    default: break;
+                case 'n':
+                    c = '\n';
+                    break;
+                case 't':
+                    c = '\t';
+                    break;
+                case 'r':
+                    c = '\r';
+                    break;
+                case 'b':
+                    c = '\b';
+                    break;
+                case 'f':
+                    c = '\f';
+                    break;
+                case '\\':
+                    c = '\\';
+                    break;
+                case '"':
+                    c = '"';
+                    break;
+                default:
+                    break;
                 }
-                if (ai + 1 < sizeof(arg)) arg[ai++] = c;
+                if (ai + 1 < sizeof(arg)) {
+                    arg[ai++] = c;
+                }
                 v++;
                 continue;
             }
-            if (ai + 1 < sizeof(arg)) arg[ai++] = *v;
+            if (ai + 1 < sizeof(arg)) {
+                arg[ai++] = *v;
+            }
             v++;
         }
-        if (*v != '"') return -1;
+        if (*v != '"') {
+            return -1;
+        }
         arg[ai] = '\0';
         if (!first) {
-            if (off + 1 >= n) break;
+            if (off + 1 >= n) {
+                break;
+            }
             out[off++] = ' ';
             out[off] = '\0';
         }
-        if (append_cmd_escaped(out, n, &off, arg) != 0) break;
+        if (append_cmd_escaped(out, n, &off, arg) != 0) {
+            break;
+        }
         first = false;
-        if (*v == '"') v++;
+        if (*v == '"') {
+            v++;
+        }
     }
     return 0;
 }
 
-static int load_record(const char *path, record_t *r) {
+static int load_record(const char *path, struct record *r) {
     memset(r, 0, sizeof(*r));
     FILE *f = fopen(path, "r");
-    if (!f) return -1;
+    if (!f) {
+        return -1;
+    }
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
     char *j = malloc((size_t)sz + 1);
-    if (!j) { fclose(f); return -1; }
-    if (fread(j, 1, (size_t)sz, f) != (size_t)sz) { free(j); fclose(f); return -1; }
+    if (!j) {
+        fclose(f);
+        return -1;
+    }
+    if (fread(j, 1, (size_t)sz, f) != (size_t)sz) {
+        free(j);
+        fclose(f);
+        return -1;
+    }
     j[sz] = '\0';
     fclose(f);
 
     int64_t tmp = 0;
-    json_get_i64(j, "version", &tmp); r->version = (int)tmp;
+    json_get_i64(j, "version", &tmp);
+    r->version = (int)tmp;
     json_get_str(j, "id", r->id, sizeof(r->id));
-    json_get_i64(j, "pid", &tmp); r->pid = (pid_t)tmp;
-    json_get_i64(j, "pgid", &tmp); r->pgid = (pid_t)tmp;
-    json_get_i64(j, "sid", &tmp); r->sid = (pid_t)tmp;
+    json_get_i64(j, "pid", &tmp);
+    r->pid = (pid_t)tmp;
+    json_get_i64(j, "pgid", &tmp);
+    r->pgid = (pid_t)tmp;
+    json_get_i64(j, "sid", &tmp);
+    r->sid = (pid_t)tmp;
     json_get_i64(j, "start_unix_ns", &r->start_unix_ns);
-    json_get_i64(j, "uid", &tmp); r->uid = (uid_t)tmp;
-    json_get_i64(j, "gid", &tmp); r->gid = (gid_t)tmp;
-    if (json_get_str(j, "log_path", r->log_path, sizeof(r->log_path)) == 0) r->has_log = true;
-    if (json_get_str(j, "boot_id", r->boot_id, sizeof(r->boot_id)) == 0) r->has_boot = true;
+    json_get_i64(j, "uid", &tmp);
+    r->uid = (uid_t)tmp;
+    json_get_i64(j, "gid", &tmp);
+    r->gid = (gid_t)tmp;
+    if (json_get_str(j, "log_path", r->log_path, sizeof(r->log_path)) == 0) {
+        r->has_log = true;
+    }
+    if (json_get_str(j, "boot_id", r->boot_id, sizeof(r->boot_id)) == 0) {
+        r->has_boot = true;
+    }
     json_get_u64(j, "proc_starttime_ticks", &r->proc_starttime_ticks);
     json_get_u64(j, "exe_dev", &r->exe_dev);
     json_get_u64(j, "exe_ino", &r->exe_ino);
@@ -516,62 +764,100 @@ static int load_record(const char *path, record_t *r) {
     return 0;
 }
 
-static run_state_t eval_state(const record_t *r, const char *current_boot) {
-    if (r->pgid <= 1) return STATE_UNKNOWN;
-    if (r->has_boot && current_boot && strcmp(r->boot_id, current_boot) != 0) return STATE_STALE;
+static enum run_state eval_state(const struct record *r, const char *current_boot) {
+    if (r->pgid <= 1) {
+        return STATE_UNKNOWN;
+    }
+    if (r->has_boot && current_boot && strcmp(r->boot_id, current_boot) != 0) {
+        return STATE_STALE;
+    }
     char state = 0;
     uint64_t now_starttime = 0;
     bool has_stat = read_proc_stat_tokens(r->pid, &state, &now_starttime) == 0;
     bool present = has_stat || leader_present(r->pid);
-    if (has_stat && state == 'Z') return STATE_DEAD;
+    if (has_stat && state == 'Z') {
+        return STATE_DEAD;
+    }
     if (present) {
         if (r->proc_starttime_ticks && has_stat) {
-            if (now_starttime != r->proc_starttime_ticks) return STATE_STALE;
+            if (now_starttime != r->proc_starttime_ticks) {
+                return STATE_STALE;
+            }
         }
         if (r->exe_dev && r->exe_ino) {
             uint64_t d, i;
-            if (read_proc_exe(r->pid, &d, &i) == 0 && (d != r->exe_dev || i != r->exe_ino)) return STATE_STALE;
+            if (read_proc_exe(r->pid, &d, &i) == 0 && (d != r->exe_dev || i != r->exe_ino)) {
+                return STATE_STALE;
+            }
         }
         return STATE_RUNNING;
     }
     int g = group_exists(r->pgid);
-    if (g == 1) return STATE_RUNNING;
-    if (g == 0) return STATE_DEAD;
+    if (g == 1) {
+        return STATE_RUNNING;
+    }
+    if (g == 0) {
+        return STATE_DEAD;
+    }
     return STATE_UNKNOWN;
 }
 
 static int perform_start(const char *dir, bool persistent, int argc, char **argv) {
     char id[16], log_path[1200], boot_id[128] = {0};
-    if (persistent && get_boot_id(boot_id, sizeof(boot_id)) != 0) persistent = false;
-    if (gen_id(dir, id, sizeof(id)) != 0) die_errno("sigmund: failed to generate id");
-    if (checked_snprintf(log_path, sizeof(log_path), "%s/%s.log", dir, id) != 0) die_errno("sigmund: log path too long");
+    if (persistent && get_boot_id(boot_id, sizeof(boot_id)) != 0) {
+        persistent = false;
+    }
+    if (gen_id(dir, id, sizeof(id)) != 0) {
+        die_errno("sigmund: failed to generate id");
+    }
+    if (checked_snprintf(log_path, sizeof(log_path), "%s/%s.log", dir, id) != 0) {
+        die_errno("sigmund: log path too long");
+    }
 
     int pipefd[2];
 #ifdef O_CLOEXEC
     if (pipe2(pipefd, O_CLOEXEC) != 0)
 #endif
     {
-        if (pipe(pipefd) != 0) die_errno("sigmund: pipe failed");
+        if (pipe(pipefd) != 0) {
+            die_errno("sigmund: pipe failed");
+        }
         fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
         fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
     }
     bool interactive = isatty(STDOUT_FILENO) && isatty(STDERR_FILENO);
 
     pid_t pid = fork();
-    if (pid < 0) die_errno("sigmund: fork failed");
+    if (pid < 0) {
+        die_errno("sigmund: fork failed");
+    }
     if (pid == 0) {
         close(pipefd[0]);
-        if (setsid() < 0) { int e = errno; write_all(pipefd[1], &e, sizeof(e)); _exit(127); }
+        if (setsid() < 0) {
+            int e = errno;
+            write_all(pipefd[1], &e, sizeof(e));
+            _exit(127);
+        }
         int nullfd = open("/dev/null", O_RDONLY);
-        if (nullfd < 0 || dup2(nullfd, STDIN_FILENO) < 0) { int e = errno; write_all(pipefd[1], &e, sizeof(e)); _exit(127); }
-        if (nullfd > 2) close(nullfd);
+        if (nullfd < 0 || dup2(nullfd, STDIN_FILENO) < 0) {
+            int e = errno;
+            write_all(pipefd[1], &e, sizeof(e));
+            _exit(127);
+        }
+        if (nullfd > 2) {
+            close(nullfd);
+        }
 
         if (!interactive) {
             int lfd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
             if (lfd < 0 || dup2(lfd, STDOUT_FILENO) < 0 || dup2(lfd, STDERR_FILENO) < 0) {
-                int e = errno; write_all(pipefd[1], &e, sizeof(e)); _exit(127);
+                int e = errno;
+                write_all(pipefd[1], &e, sizeof(e));
+                _exit(127);
             }
-            if (lfd > 2) close(lfd);
+            if (lfd > 2) {
+                close(lfd);
+            }
         }
         execvp(argv[0], argv);
         int e = errno;
@@ -590,7 +876,7 @@ static int perform_start(const char *dir, bool persistent, int argc, char **argv
         return 1;
     }
 
-    record_t r = {0};
+    struct record r = {0};
     r.version = 1;
     snprintf(r.id, sizeof(r.id), "%s", id);
     r.pid = pid;
@@ -602,52 +888,83 @@ static int perform_start(const char *dir, bool persistent, int argc, char **argv
     r.uid = getuid();
     r.gid = getgid();
     r.has_log = !interactive;
-    if (r.has_log) { strncpy(r.log_path, log_path, sizeof(r.log_path)-1); r.log_path[sizeof(r.log_path)-1]=0; }
+    if (r.has_log) {
+        strncpy(r.log_path, log_path, sizeof(r.log_path) - 1);
+        r.log_path[sizeof(r.log_path) - 1] = 0;
+    }
     r.has_boot = persistent;
-    if (r.has_boot) snprintf(r.boot_id, sizeof(r.boot_id), "%s", boot_id);
+    if (r.has_boot) {
+        snprintf(r.boot_id, sizeof(r.boot_id), "%s", boot_id);
+    }
     read_proc_stat_tokens(pid, NULL, &r.proc_starttime_ticks);
     read_proc_exe(pid, &r.exe_dev, &r.exe_ino);
     size_t off = 0;
     r.cmdline[0] = '\0';
     for (int i = 0; i < argc; i++) {
         if (i > 0) {
-            if (off + 1 >= sizeof(r.cmdline)) break;
+            if (off + 1 >= sizeof(r.cmdline)) {
+                break;
+            }
             r.cmdline[off++] = ' ';
             r.cmdline[off] = '\0';
         }
-        if (append_cmd_escaped(r.cmdline, sizeof(r.cmdline), &off, argv[i]) != 0) break;
+        if (append_cmd_escaped(r.cmdline, sizeof(r.cmdline), &off, argv[i]) != 0) {
+            break;
+        }
     }
-    if (write_record_atomic(dir, &r, argc, argv, NULL, 0) != 0) die_errno("sigmund: failed to write record");
+    if (write_record_atomic(dir, &r, argc, argv, NULL, 0) != 0) {
+        die_errno("sigmund: failed to write record");
+    }
 
     printf("sigmund: id=%s pid=%ld pgid=%ld sid=%ld\n", r.id, (long)r.pid, (long)r.pgid, (long)r.sid);
-    if (r.has_log) printf("sigmund: log: %s\n", r.log_path);
+    if (r.has_log) {
+        printf("sigmund: log: %s\n", r.log_path);
+    }
     return 0;
 }
 
-static int load_record_by_id(const char *dir, const char *id, record_t *r, char *path, size_t n) {
-    if (!valid_id(id)) return -1;
-    if (checked_snprintf(path, n, "%s/%s.json", dir, id) != 0) return -1;
-    if (access(path, F_OK) != 0) return -1;
+static int load_record_by_id(const char *dir, const char *id, struct record *r, char *path, size_t n) {
+    if (!valid_id(id)) {
+        return -1;
+    }
+    if (checked_snprintf(path, n, "%s/%s.json", dir, id) != 0) {
+        return -1;
+    }
+    if (access(path, F_OK) != 0) {
+        return -1;
+    }
     return load_record(path, r);
 }
 
 static int do_signal_action(const char *dir, const char *id, int sig, bool graceful) {
-    record_t r;
+    struct record r;
     char path[1200], boot[128] = {0};
-    if (load_record_by_id(dir, id, &r, path, sizeof(path)) != 0) return 5;
+    if (load_record_by_id(dir, id, &r, path, sizeof(path)) != 0) {
+        return 5;
+    }
     if (r.pgid <= 1) {
         fprintf(stderr, "sigmund: error: invalid pgid %ld in record file\n", (long)r.pgid);
         return 5;
     }
-    if (r.has_boot && get_boot_id(boot, sizeof(boot)) == 0 && strcmp(r.boot_id, boot) != 0) return 2;
+    if (r.has_boot && get_boot_id(boot, sizeof(boot)) == 0 && strcmp(r.boot_id, boot) != 0) {
+        return 2;
+    }
 
-    run_state_t st = eval_state(&r, r.has_boot ? boot : NULL);
-    if (st == STATE_STALE) return 2;
-    if (st == STATE_DEAD) return 0;
+    enum run_state st = eval_state(&r, r.has_boot ? boot : NULL);
+    if (st == STATE_STALE) {
+        return 2;
+    }
+    if (st == STATE_DEAD) {
+        return 0;
+    }
 
     if (kill(-r.pgid, sig) != 0) {
-        if (errno == EPERM) return 3;
-        if (errno == ESRCH) return 0;
+        if (errno == EPERM) {
+            return 3;
+        }
+        if (errno == ESRCH) {
+            return 0;
+        }
         return 4;
     }
 
@@ -665,7 +982,9 @@ static int do_signal_action(const char *dir, const char *id, int sig, bool grace
             waited += POLL_SLEEP_MS;
         }
         if (kill(-r.pgid, SIGKILL) != 0 && errno != ESRCH) {
-            if (errno == EPERM) return 3;
+            if (errno == EPERM) {
+                return 3;
+            }
             return 4;
         }
         int g = group_exists(r.pgid);
@@ -679,12 +998,16 @@ static int do_signal_action(const char *dir, const char *id, int sig, bool grace
     return 0;
 }
 
-static const char *state_str(run_state_t s) {
+static const char *state_str(enum run_state s) {
     switch (s) {
-        case STATE_RUNNING: return "running";
-        case STATE_DEAD: return "dead";
-        case STATE_STALE: return "stale";
-        default: return "unknown";
+    case STATE_RUNNING:
+        return "running";
+    case STATE_DEAD:
+        return "dead";
+    case STATE_STALE:
+        return "stale";
+    default:
+        return "unknown";
     }
 }
 
@@ -693,39 +1016,58 @@ static void format_age(int64_t start_ns, char *out, size_t n) {
     clock_gettime(CLOCK_REALTIME, &ts);
     int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
     int64_t sec = (now - start_ns) / 1000000000LL;
-    if (sec < 0) sec = 0;
+    if (sec < 0) {
+        sec = 0;
+    }
     int64_t days = sec / 86400;
     int64_t hours = (sec % 86400) / 3600;
     int64_t mins = (sec % 3600) / 60;
-    if (days > 0) snprintf(out, n, "%" PRId64 "d%" PRId64 "h", days, hours);
-    else if (hours > 0) snprintf(out, n, "%" PRId64 "h%" PRId64 "m", hours, mins);
-    else if (mins > 0) snprintf(out, n, "%" PRId64 "m", mins);
-    else snprintf(out, n, "%" PRId64 "s", sec);
+    if (days > 0) {
+        snprintf(out, n, "%" PRId64 "d%" PRId64 "h", days, hours);
+    } else if (hours > 0) {
+        snprintf(out, n, "%" PRId64 "h%" PRId64 "m", hours, mins);
+    } else if (mins > 0) {
+        snprintf(out, n, "%" PRId64 "m", mins);
+    } else {
+        snprintf(out, n, "%" PRId64 "s", sec);
+    }
 }
 
 static int cmd_list(const char *dir) {
     DIR *d = opendir(dir);
-    if (!d) return 0;
+    if (!d) {
+        return 0;
+    }
     char boot[128] = {0};
     get_boot_id(boot, sizeof(boot));
     printf("%-7s %-8s %-8s %-6s %-8s %s\n", "ID", "PID", "PGID", "AGE", "STATE", "CMD");
     const struct dirent *e;
     while ((e = readdir(d))) {
-        if (!has_suffix(e->d_name, ".json")) continue;
+        if (!has_suffix(e->d_name, ".json")) {
+            continue;
+        }
         char path[1200];
-        if (checked_snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) != 0) continue;
-        record_t r;
-        if (load_record(path, &r) != 0) continue;
+        if (checked_snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) != 0) {
+            continue;
+        }
+        struct record r;
+        if (load_record(path, &r) != 0) {
+            continue;
+        }
         if (!valid_record(&r)) {
             fprintf(stderr, "sigmund: warning: skipping corrupt record %s\n", e->d_name);
             continue;
         }
-        run_state_t st = eval_state(&r, r.has_boot ? boot : NULL);
+        enum run_state st = eval_state(&r, r.has_boot ? boot : NULL);
         char age[32];
         format_age(r.start_unix_ns, age, sizeof(age));
         char cmd[64];
-        strncpy(cmd, r.cmdline[0] ? r.cmdline : "?", sizeof(cmd)-1); cmd[sizeof(cmd)-1]=0;
-        if (strlen(cmd) > 48) { cmd[48] = '\0'; strcat(cmd, "..."); }
+        strncpy(cmd, r.cmdline[0] ? r.cmdline : "?", sizeof(cmd) - 1);
+        cmd[sizeof(cmd) - 1] = 0;
+        if (strlen(cmd) > 48) {
+            cmd[48] = '\0';
+            strcat(cmd, "...");
+        }
         printf("%-7s %-8ld %-8ld %-6s %-8s %s\n", r.id, (long)r.pid, (long)r.pgid, age, state_str(st), cmd);
     }
     closedir(d);
@@ -734,40 +1076,64 @@ static int cmd_list(const char *dir) {
 
 static int cmd_prune(const char *dir) {
     DIR *d = opendir(dir);
-    if (!d) return 0;
+    if (!d) {
+        return 0;
+    }
     char boot[128] = {0};
     get_boot_id(boot, sizeof(boot));
     const struct dirent *e;
     while ((e = readdir(d))) {
-        if (!has_suffix(e->d_name, ".json")) continue;
+        if (!has_suffix(e->d_name, ".json")) {
+            continue;
+        }
         char path[1200];
-        if (checked_snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) != 0) continue;
-        record_t r;
-        if (load_record(path, &r) != 0) continue;
+        if (checked_snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) != 0) {
+            continue;
+        }
+        struct record r;
+        if (load_record(path, &r) != 0) {
+            continue;
+        }
         if (!valid_record(&r)) {
             unlink(path);
             continue;
         }
         if (eval_state(&r, r.has_boot ? boot : NULL) == STATE_DEAD) {
             unlink(path);
-            if (r.has_log) unlink(r.log_path);
+            if (r.has_log) {
+                unlink(r.log_path);
+            }
         }
     }
     rewinddir(d);
     while ((e = readdir(d))) {
-        if (!has_suffix(e->d_name, ".log")) continue;
+        if (!has_suffix(e->d_name, ".log")) {
+            continue;
+        }
         size_t len = strlen(e->d_name);
-        if (len <= 4) continue;
+        if (len <= 4) {
+            continue;
+        }
         char id[32];
         size_t id_len = len - 4;
-        if (id_len >= sizeof(id)) continue;
+        if (id_len >= sizeof(id)) {
+            continue;
+        }
         memcpy(id, e->d_name, id_len);
         id[id_len] = '\0';
-        if (!valid_id(id)) continue;
+        if (!valid_id(id)) {
+            continue;
+        }
         char json_path[1200], log_path[1200];
-        if (checked_snprintf(json_path, sizeof(json_path), "%s/%s.json", dir, id) != 0) continue;
-        if (checked_snprintf(log_path, sizeof(log_path), "%s/%s", dir, e->d_name) != 0) continue;
-        if (access(json_path, F_OK) != 0) unlink(log_path);
+        if (checked_snprintf(json_path, sizeof(json_path), "%s/%s.json", dir, id) != 0) {
+            continue;
+        }
+        if (checked_snprintf(log_path, sizeof(log_path), "%s/%s", dir, e->d_name) != 0) {
+            continue;
+        }
+        if (access(json_path, F_OK) != 0) {
+            unlink(log_path);
+        }
     }
     closedir(d);
     return 0;
@@ -784,19 +1150,30 @@ static void usage(void) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { usage(); return 1; }
+    if (argc < 2) {
+        usage();
+        return 1;
+    }
 
     char dir[1024];
     bool persistent = false;
-    if (ensure_storage(dir, sizeof(dir), &persistent) != 0) die_errno("sigmund: failed to init storage");
+    if (ensure_storage(dir, sizeof(dir), &persistent) != 0) {
+        die_errno("sigmund: failed to init storage");
+    }
 
     if (!strcmp(argv[1], "--")) {
-        if (argc < 3) return 5;
+        if (argc < 3) {
+            return 5;
+        }
         return perform_start(dir, persistent, argc - 2, argv + 2);
     }
 
-    if (!strcmp(argv[1], "-l") || !strcmp(argv[1], "--list")) return cmd_list(dir);
-    if (!strcmp(argv[1], "prune")) return cmd_prune(dir);
+    if (!strcmp(argv[1], "-l") || !strcmp(argv[1], "--list")) {
+        return cmd_list(dir);
+    }
+    if (!strcmp(argv[1], "prune")) {
+        return cmd_prune(dir);
+    }
     if (!strcmp(argv[1], "stop")) {
         if (argc != 3) {
             fprintf(stderr, "usage: sigmund stop <id>\n");
@@ -816,8 +1193,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "usage: sigmund killcmd <id>\n");
             return 5;
         }
-        record_t r; char path[1200];
-        if (load_record_by_id(dir, argv[2], &r, path, sizeof(path)) != 0) return 5;
+        struct record r;
+        char path[1200];
+        if (load_record_by_id(dir, argv[2], &r, path, sizeof(path)) != 0) {
+            return 5;
+        }
         if (r.pgid <= 1) {
             fprintf(stderr, "sigmund: error: invalid pgid %ld in record file\n", (long)r.pgid);
             return 5;
@@ -825,8 +1205,14 @@ int main(int argc, char **argv) {
         printf("kill -TERM -- -%ld\n", (long)r.pgid);
         return 0;
     }
-    if (!strcmp(argv[1], "--version")) { puts(SIGMUND_VERSION); return 0; }
-    if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) { usage(); return 0; }
+    if (!strcmp(argv[1], "--version")) {
+        puts(SIGMUND_VERSION);
+        return 0;
+    }
+    if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
+        usage();
+        return 0;
+    }
 
     return perform_start(dir, persistent, argc - 1, argv + 1);
 }
