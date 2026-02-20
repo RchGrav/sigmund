@@ -410,7 +410,21 @@ static int json_get_str(const char *j, const char *k, char *out, size_t n) {
     v++;
     size_t i = 0;
     while (*v && *v != '"' && i + 1 < n) {
-        if (*v == '\\' && v[1]) v++;
+        if (*v == '\\' && v[1]) {
+            v++;
+            switch (*v) {
+                case 'n': out[i++] = '\n'; break;
+                case 't': out[i++] = '\t'; break;
+                case 'r': out[i++] = '\r'; break;
+                case 'b': out[i++] = '\b'; break;
+                case 'f': out[i++] = '\f'; break;
+                case '\\': out[i++] = '\\'; break;
+                case '"': out[i++] = '"'; break;
+                default: out[i++] = *v; break;
+            }
+            v++;
+            continue;
+        }
         out[i++] = *v++;
     }
     out[i] = '\0';
@@ -432,7 +446,23 @@ static int json_get_argv_display(const char *j, char *out, size_t n) {
         char arg[256];
         size_t ai = 0;
         while (*v && *v != '"') {
-            if (*v == '\\' && v[1]) v++;
+            if (*v == '\\' && v[1]) {
+                v++;
+                char c = *v;
+                switch (*v) {
+                    case 'n': c = '\n'; break;
+                    case 't': c = '\t'; break;
+                    case 'r': c = '\r'; break;
+                    case 'b': c = '\b'; break;
+                    case 'f': c = '\f'; break;
+                    case '\\': c = '\\'; break;
+                    case '"': c = '"'; break;
+                    default: break;
+                }
+                if (ai + 1 < sizeof(arg)) arg[ai++] = c;
+                v++;
+                continue;
+            }
             if (ai + 1 < sizeof(arg)) arg[ai++] = *v;
             v++;
         }

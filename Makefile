@@ -9,4 +9,8 @@ sigmund: src/sigmund.c
 clean:
 	rm -f sigmund
 
-.PHONY: all clean
+.PHONY: all clean test
+
+
+test: sigmund
+	@bash tests/test_sigmund.sh
