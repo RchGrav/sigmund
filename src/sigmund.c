@@ -22,6 +22,7 @@
 #define ID_HEX_LEN 6
 #define STOP_TIMEOUT_MS 5000
 #define POLL_SLEEP_MS 25
+#define SIGMUND_VERSION "0.1.0"
 
 typedef struct {
     int version;
@@ -64,6 +65,24 @@ static int checked_snprintf(char *dst, size_t n, const char *fmt, ...) {
         return -1;
     }
     return 0;
+}
+
+static bool has_suffix(const char *s, const char *suffix) {
+    size_t sl = strlen(s), sufl = strlen(suffix);
+    return sl >= sufl && strcmp(s + (sl - sufl), suffix) == 0;
+}
+
+static bool valid_id(const char *id) {
+    size_t len = strlen(id);
+    if (len < 6 || len > 10) return false;
+    for (size_t i = 0; i < len; i++) {
+        if (!isdigit((unsigned char)id[i]) && !(id[i] >= 'a' && id[i] <= 'f')) return false;
+    }
+    return true;
+}
+
+static bool valid_record(const record_t *r) {
+    return r->pid > 0 && r->pgid > 1 && r->id[0] != '\0';
 }
 
 static int mkdir_p0700(const char *dir) {
@@ -466,6 +485,7 @@ static int load_record(const char *path, record_t *r) {
 }
 
 static run_state_t eval_state(const record_t *r, const char *current_boot) {
+    if (r->pgid <= 1) return STATE_UNKNOWN;
     if (r->has_boot && current_boot && strcmp(r->boot_id, current_boot) != 0) return STATE_STALE;
     char state = 0;
     uint64_t now_starttime = 0;
@@ -488,10 +508,8 @@ static run_state_t eval_state(const record_t *r, const char *current_boot) {
     return STATE_UNKNOWN;
 }
 
-static int perform_start(int argc, char **argv) {
-    char dir[1024], id[16], log_path[1200], boot_id[128] = {0};
-    bool persistent = false;
-    if (ensure_storage(dir, sizeof(dir), &persistent) != 0) die_errno("sigmund: failed to prepare storage");
+static int perform_start(const char *dir, bool persistent, int argc, char **argv) {
+    char id[16], log_path[1200], boot_id[128] = {0};
     if (persistent && get_boot_id(boot_id, sizeof(boot_id)) != 0) persistent = false;
     if (gen_id(dir, id, sizeof(id)) != 0) die_errno("sigmund: failed to generate id");
     if (checked_snprintf(log_path, sizeof(log_path), "%s/%s.log", dir, id) != 0) die_errno("sigmund: log path too long");
@@ -575,6 +593,7 @@ static int perform_start(int argc, char **argv) {
 }
 
 static int load_record_by_id(const char *dir, const char *id, record_t *r, char *path, size_t n) {
+    if (!valid_id(id)) return -1;
     if (checked_snprintf(path, n, "%s/%s.json", dir, id) != 0) return -1;
     if (access(path, F_OK) != 0) return -1;
     return load_record(path, r);
@@ -643,7 +662,13 @@ static void format_age(int64_t start_ns, char *out, size_t n) {
     int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
     int64_t sec = (now - start_ns) / 1000000000LL;
     if (sec < 0) sec = 0;
-    snprintf(out, n, "%" PRId64 "s", sec);
+    int64_t days = sec / 86400;
+    int64_t hours = (sec % 86400) / 3600;
+    int64_t mins = (sec % 3600) / 60;
+    if (days > 0) snprintf(out, n, "%" PRId64 "d%" PRId64 "h", days, hours);
+    else if (hours > 0) snprintf(out, n, "%" PRId64 "h%" PRId64 "m", hours, mins);
+    else if (mins > 0) snprintf(out, n, "%" PRId64 "m", mins);
+    else snprintf(out, n, "%" PRId64 "s", sec);
 }
 
 static int cmd_list(const char *dir) {
@@ -654,11 +679,15 @@ static int cmd_list(const char *dir) {
     printf("%-7s %-8s %-8s %-6s %-8s %s\n", "ID", "PID", "PGID", "AGE", "STATE", "CMD");
     struct dirent *e;
     while ((e = readdir(d))) {
-        if (!strstr(e->d_name, ".json")) continue;
+        if (!has_suffix(e->d_name, ".json")) continue;
         char path[1200];
         if (checked_snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) != 0) continue;
         record_t r;
         if (load_record(path, &r) != 0) continue;
+        if (!valid_record(&r)) {
+            fprintf(stderr, "sigmund: warning: skipping corrupt record %s\n", e->d_name);
+            continue;
+        }
         run_state_t st = eval_state(&r, r.has_boot ? boot : NULL);
         char age[32];
         format_age(r.start_unix_ns, age, sizeof(age));
@@ -678,15 +707,35 @@ static int cmd_prune(const char *dir) {
     get_boot_id(boot, sizeof(boot));
     struct dirent *e;
     while ((e = readdir(d))) {
-        if (!strstr(e->d_name, ".json")) continue;
+        if (!has_suffix(e->d_name, ".json")) continue;
         char path[1200];
         if (checked_snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) != 0) continue;
         record_t r;
         if (load_record(path, &r) != 0) continue;
+        if (!valid_record(&r)) {
+            unlink(path);
+            continue;
+        }
         if (eval_state(&r, r.has_boot ? boot : NULL) == STATE_DEAD) {
             unlink(path);
             if (r.has_log) unlink(r.log_path);
         }
+    }
+    rewinddir(d);
+    while ((e = readdir(d))) {
+        if (!has_suffix(e->d_name, ".log")) continue;
+        size_t len = strlen(e->d_name);
+        if (len <= 4) continue;
+        char id[32];
+        size_t id_len = len - 4;
+        if (id_len >= sizeof(id)) continue;
+        memcpy(id, e->d_name, id_len);
+        id[id_len] = '\0';
+        if (!valid_id(id)) continue;
+        char json_path[1200], log_path[1200];
+        if (checked_snprintf(json_path, sizeof(json_path), "%s/%s.json", dir, id) != 0) continue;
+        if (checked_snprintf(log_path, sizeof(log_path), "%s/%s", dir, e->d_name) != 0) continue;
+        if (access(json_path, F_OK) != 0) unlink(log_path);
     }
     closedir(d);
     return 0;
@@ -698,7 +747,8 @@ static void usage(void) {
          "       sigmund stop <id>\n"
          "       sigmund kill <id>\n"
          "       sigmund killcmd <id>\n"
-         "       sigmund prune");
+         "       sigmund prune\n"
+         "       sigmund --version");
 }
 
 int main(int argc, char **argv) {
@@ -710,7 +760,7 @@ int main(int argc, char **argv) {
 
     if (!strcmp(argv[1], "--")) {
         if (argc < 3) return 5;
-        return perform_start(argc - 2, argv + 2);
+        return perform_start(dir, persistent, argc - 2, argv + 2);
     }
 
     if (!strcmp(argv[1], "-l") || !strcmp(argv[1], "--list")) return cmd_list(dir);
@@ -743,7 +793,8 @@ int main(int argc, char **argv) {
         printf("kill -TERM -- -%ld\n", (long)r.pgid);
         return 0;
     }
+    if (!strcmp(argv[1], "--version")) { puts(SIGMUND_VERSION); return 0; }
     if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) { usage(); return 0; }
 
-    return perform_start(argc - 1, argv + 1);
+    return perform_start(dir, persistent, argc - 1, argv + 1);
 }
