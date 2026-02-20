@@ -492,7 +492,7 @@ static int perform_start(int argc, char **argv) {
     char dir[1024], id[16], log_path[1200], boot_id[128] = {0};
     bool persistent = false;
     if (ensure_storage(dir, sizeof(dir), &persistent) != 0) die_errno("sigmund: failed to prepare storage");
-    if (persistent && get_boot_id(boot_id, sizeof(boot_id)) != 0) die_errno("sigmund: failed to read boot_id");
+    if (persistent && get_boot_id(boot_id, sizeof(boot_id)) != 0) persistent = false;
     if (gen_id(dir, id, sizeof(id)) != 0) die_errno("sigmund: failed to generate id");
     if (checked_snprintf(log_path, sizeof(log_path), "%s/%s.log", dir, id) != 0) die_errno("sigmund: log path too long");
 
@@ -584,6 +584,10 @@ static int do_signal_action(const char *dir, const char *id, int sig, bool grace
     record_t r;
     char path[1200], boot[128] = {0};
     if (load_record_by_id(dir, id, &r, path, sizeof(path)) != 0) return 5;
+    if (r.pgid <= 1) {
+        fprintf(stderr, "sigmund: error: invalid pgid %ld in record file\n", (long)r.pgid);
+        return 5;
+    }
     if (r.has_boot && get_boot_id(boot, sizeof(boot)) == 0 && strcmp(r.boot_id, boot) != 0) return 2;
 
     run_state_t st = eval_state(&r, r.has_boot ? boot : NULL);
@@ -647,7 +651,7 @@ static int cmd_list(const char *dir) {
     if (!d) return 0;
     char boot[128] = {0};
     get_boot_id(boot, sizeof(boot));
-    printf("ID      PID      PGID     AGE    STATE    CMD\n");
+    printf("%-7s %-8s %-8s %-6s %-8s %s\n", "ID", "PID", "PGID", "AGE", "STATE", "CMD");
     struct dirent *e;
     while ((e = readdir(d))) {
         if (!strstr(e->d_name, ".json")) continue;
@@ -712,17 +716,30 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "-l") || !strcmp(argv[1], "--list")) return cmd_list(dir);
     if (!strcmp(argv[1], "prune")) return cmd_prune(dir);
     if (!strcmp(argv[1], "stop")) {
-        if (argc != 3) return 5;
+        if (argc != 3) {
+            fprintf(stderr, "usage: sigmund stop <id>\n");
+            return 5;
+        }
         return do_signal_action(dir, argv[2], SIGTERM, true);
     }
     if (!strcmp(argv[1], "kill")) {
-        if (argc != 3) return 5;
+        if (argc != 3) {
+            fprintf(stderr, "usage: sigmund kill <id>\n");
+            return 5;
+        }
         return do_signal_action(dir, argv[2], SIGKILL, false);
     }
     if (!strcmp(argv[1], "killcmd")) {
-        if (argc != 3) return 5;
+        if (argc != 3) {
+            fprintf(stderr, "usage: sigmund killcmd <id>\n");
+            return 5;
+        }
         record_t r; char path[1200];
         if (load_record_by_id(dir, argv[2], &r, path, sizeof(path)) != 0) return 5;
+        if (r.pgid <= 1) {
+            fprintf(stderr, "sigmund: error: invalid pgid %ld in record file\n", (long)r.pgid);
+            return 5;
+        }
         printf("kill -TERM -- -%ld\n", (long)r.pgid);
         return 0;
     }
