@@ -17,10 +17,6 @@ Many CI runners (like GitHub Actions or GitLab CI) and non-interactive job syste
 * **Safer than bare `kill $PID`:** Immune to PID recycling. `sigmund` verifies `/proc/<pid>/stat` start times and `/proc/<pid>/exe` inodes before sending signals, so you never accidentally kill a critical system service days later.
 * **Lighter than `systemd-run` or `tmux`:** Zero dependencies, no background daemon, no D-Bus required. Just a single compiled C binary.
 
-
-## Status
-Private kickoff. Interface and behavior are stabilizing. Source of truth: `docs/SPEC.md`
-
 ## Quickstart
 
 **Build:**
