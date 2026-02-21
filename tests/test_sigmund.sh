@@ -178,6 +178,24 @@ test_killcmd_output() {
   [ "$got" = "kill -TERM -- -$pgid" ]
 }
 
+test_stop_multiple_ids() {
+  local out1 out2 id1 id2 pgid1 pgid2 rc
+  out1=$("$SIGMUND_BIN" sleep 300 2>&1) || return 1
+  out2=$("$SIGMUND_BIN" sleep 300 2>&1) || return 1
+  id1=$(printf '%s\n' "$out1" | extract_id)
+  id2=$(printf '%s\n' "$out2" | extract_id)
+  pgid1=$(sed -n 's/.*pgid=\([0-9][0-9]*\).*/\1/p' <<<"$out1" | head -n1)
+  pgid2=$(sed -n 's/.*pgid=\([0-9][0-9]*\).*/\1/p' <<<"$out2" | head -n1)
+  [ -n "$id1" ] && [ -n "$id2" ] && [ -n "$pgid1" ] && [ -n "$pgid2" ] || return 1
+  set +e
+  "$SIGMUND_BIN" stop "$id1" "$id2" >/dev/null
+  rc=$?
+  set -e
+  [ "$rc" -eq 0 ] || return 1
+  pgid_terminated "$pgid1" || return 1
+  pgid_terminated "$pgid2"
+}
+
 test_argument_edges() {
   local rc out
   set +e
@@ -245,6 +263,7 @@ run_test "invalid pgid=0 record is not listed as running" test_invalid_pgid_reco
 run_test "orphan logs are removed by prune" test_orphan_log_cleanup
 run_test "ID input sanitization rejects invalid ids" test_id_sanitization
 run_test "killcmd prints group kill command" test_killcmd_output
+run_test "stop supports multiple IDs in one command" test_stop_multiple_ids
 run_test "argument edge cases" test_argument_edges
 run_test "special characters are preserved in argv JSON" test_special_chars_args
 run_test "non-interactive logging captures stdout+stderr" test_log_capture

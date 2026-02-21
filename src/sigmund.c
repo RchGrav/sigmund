@@ -1142,9 +1142,9 @@ static int cmd_prune(const char *dir) {
 static void usage(void) {
     puts("usage: sigmund <cmd...>\n"
          "       sigmund -l|--list\n"
-         "       sigmund stop <id>\n"
-         "       sigmund kill <id>\n"
-         "       sigmund killcmd <id>\n"
+         "       sigmund stop <id>...\n"
+         "       sigmund kill <id>...\n"
+         "       sigmund killcmd <id>...\n"
          "       sigmund prune\n"
          "       sigmund --version");
 }
@@ -1175,35 +1175,56 @@ int main(int argc, char **argv) {
         return cmd_prune(dir);
     }
     if (!strcmp(argv[1], "stop")) {
-        if (argc != 3) {
-            fprintf(stderr, "usage: sigmund stop <id>\n");
+        if (argc < 3) {
+            fprintf(stderr, "usage: sigmund stop <id>...\n");
             return 5;
         }
-        return do_signal_action(dir, argv[2], SIGTERM, true);
+        int worst = 0;
+        for (int i = 2; i < argc; i++) {
+            int rc = do_signal_action(dir, argv[i], SIGTERM, true);
+            if (rc > worst) {
+                worst = rc;
+            }
+        }
+        return worst;
     }
     if (!strcmp(argv[1], "kill")) {
-        if (argc != 3) {
-            fprintf(stderr, "usage: sigmund kill <id>\n");
+        if (argc < 3) {
+            fprintf(stderr, "usage: sigmund kill <id>...\n");
             return 5;
         }
-        return do_signal_action(dir, argv[2], SIGKILL, false);
+        int worst = 0;
+        for (int i = 2; i < argc; i++) {
+            int rc = do_signal_action(dir, argv[i], SIGKILL, false);
+            if (rc > worst) {
+                worst = rc;
+            }
+        }
+        return worst;
     }
     if (!strcmp(argv[1], "killcmd")) {
-        if (argc != 3) {
-            fprintf(stderr, "usage: sigmund killcmd <id>\n");
+        if (argc < 3) {
+            fprintf(stderr, "usage: sigmund killcmd <id>...\n");
             return 5;
         }
-        struct record r;
-        char path[1200];
-        if (load_record_by_id(dir, argv[2], &r, path, sizeof(path)) != 0) {
-            return 5;
+        int worst = 0;
+        for (int i = 2; i < argc; i++) {
+            struct record r;
+            char path[1200];
+            int rc = 0;
+            if (load_record_by_id(dir, argv[i], &r, path, sizeof(path)) != 0) {
+                rc = 5;
+            } else if (r.pgid <= 1) {
+                fprintf(stderr, "sigmund: error: invalid pgid %ld in record file\n", (long)r.pgid);
+                rc = 5;
+            } else {
+                printf("kill -TERM -- -%ld\n", (long)r.pgid);
+            }
+            if (rc > worst) {
+                worst = rc;
+            }
         }
-        if (r.pgid <= 1) {
-            fprintf(stderr, "sigmund: error: invalid pgid %ld in record file\n", (long)r.pgid);
-            return 5;
-        }
-        printf("kill -TERM -- -%ld\n", (long)r.pgid);
-        return 0;
+        return worst;
     }
     if (!strcmp(argv[1], "--version")) {
         puts(SIGMUND_VERSION);
