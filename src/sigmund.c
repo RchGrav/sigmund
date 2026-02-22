@@ -45,6 +45,13 @@ struct record {
 
 enum run_state { STATE_RUNNING, STATE_DEAD, STATE_STALE, STATE_UNKNOWN };
 
+static volatile sig_atomic_t g_tail_interrupted = 0;
+
+static void handle_tail_sigint(int signo) {
+    (void)signo;
+    g_tail_interrupted = 1;
+}
+
 static void die_errno(const char *msg) {
     int e = errno;
     fprintf(stderr, "%s: %s\n", msg, strerror(e));
@@ -802,7 +809,61 @@ static enum run_state eval_state(const struct record *r, const char *current_boo
     return STATE_UNKNOWN;
 }
 
-static int perform_start(const char *dir, bool persistent, int argc, char **argv) {
+static int tail_log_until_exit(const struct record *r) {
+    int fd = open(r->log_path, O_RDONLY);
+    if (fd < 0) {
+        die_errno("sigmund: failed to open log for tail");
+    }
+
+    char boot[128] = {0};
+    if (r->has_boot) {
+        get_boot_id(boot, sizeof(boot));
+    }
+
+    struct sigaction sa = {0}, old_sa = {0};
+    sa.sa_handler = handle_tail_sigint;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, &old_sa);
+    g_tail_interrupted = 0;
+
+    char buf[4096];
+    int sleep_polls = 0;
+    while (!g_tail_interrupted) {
+        ssize_t n = read(fd, buf, sizeof(buf));
+        if (n > 0) {
+            if (write_all(STDOUT_FILENO, buf, (size_t)n) != 0) {
+                close(fd);
+                sigaction(SIGINT, &old_sa, NULL);
+                die_errno("sigmund: failed writing tailed output");
+            }
+            continue;
+        }
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            close(fd);
+            sigaction(SIGINT, &old_sa, NULL);
+            die_errno("sigmund: failed while tailing log");
+        }
+        struct timespec sl = {.tv_sec = 0, .tv_nsec = 100 * 1000000L};
+        nanosleep(&sl, NULL);
+        sleep_polls++;
+        if (sleep_polls % 10 == 0) {
+            enum run_state st = eval_state(r, r->has_boot ? boot : NULL);
+            if (st != STATE_RUNNING) {
+                break;
+            }
+        }
+    }
+
+    close(fd);
+    sigaction(SIGINT, &old_sa, NULL);
+    return 0;
+}
+
+static int perform_start(const char *dir, bool persistent, bool tail, int argc, char **argv) {
+
     char id[16], log_path[1200], boot_id[128] = {0};
     if (persistent && get_boot_id(boot_id, sizeof(boot_id)) != 0) {
         persistent = false;
@@ -825,8 +886,6 @@ static int perform_start(const char *dir, bool persistent, int argc, char **argv
         fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
         fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
     }
-    bool interactive = isatty(STDOUT_FILENO) && isatty(STDERR_FILENO);
-
     pid_t pid = fork();
     if (pid < 0) {
         die_errno("sigmund: fork failed");
@@ -848,16 +907,14 @@ static int perform_start(const char *dir, bool persistent, int argc, char **argv
             close(nullfd);
         }
 
-        if (!interactive) {
-            int lfd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
-            if (lfd < 0 || dup2(lfd, STDOUT_FILENO) < 0 || dup2(lfd, STDERR_FILENO) < 0) {
-                int e = errno;
-                write_all(pipefd[1], &e, sizeof(e));
-                _exit(127);
-            }
-            if (lfd > 2) {
-                close(lfd);
-            }
+        int lfd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+        if (lfd < 0 || dup2(lfd, STDOUT_FILENO) < 0 || dup2(lfd, STDERR_FILENO) < 0) {
+            int e = errno;
+            write_all(pipefd[1], &e, sizeof(e));
+            _exit(127);
+        }
+        if (lfd > 2) {
+            close(lfd);
         }
         execvp(argv[0], argv);
         int e = errno;
@@ -887,11 +944,9 @@ static int perform_start(const char *dir, bool persistent, int argc, char **argv
     r.start_unix_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
     r.uid = getuid();
     r.gid = getgid();
-    r.has_log = !interactive;
-    if (r.has_log) {
-        strncpy(r.log_path, log_path, sizeof(r.log_path) - 1);
-        r.log_path[sizeof(r.log_path) - 1] = 0;
-    }
+    r.has_log = true;
+    strncpy(r.log_path, log_path, sizeof(r.log_path) - 1);
+    r.log_path[sizeof(r.log_path) - 1] = 0;
     r.has_boot = persistent;
     if (r.has_boot) {
         snprintf(r.boot_id, sizeof(r.boot_id), "%s", boot_id);
@@ -917,8 +972,12 @@ static int perform_start(const char *dir, bool persistent, int argc, char **argv
     }
 
     printf("sigmund: id=%s pid=%ld pgid=%ld sid=%ld\n", r.id, (long)r.pid, (long)r.pgid, (long)r.sid);
-    if (r.has_log) {
-        printf("sigmund: log: %s\n", r.log_path);
+    printf("sigmund: log: %s\n", r.log_path);
+    printf("sigmund: stop: sigmund stop %s\n", r.id);
+    fflush(stdout);
+
+    if (tail) {
+        return tail_log_until_exit(&r);
     }
     return 0;
 }
@@ -1140,13 +1199,17 @@ static int cmd_prune(const char *dir) {
 }
 
 static void usage(void) {
-    puts("usage: sigmund <cmd...>\n"
-         "       sigmund -l|--list\n"
-         "       sigmund stop <id>...\n"
-         "       sigmund kill <id>...\n"
-         "       sigmund killcmd <id>...\n"
-         "       sigmund prune\n"
-         "       sigmund --version");
+    printf("sigmund %s — More than nohup, less than systemd.\n\n"
+           "usage:\n"
+           "  sigmund <cmd...>              launch command in background\n"
+           "  sigmund --tail <cmd...>       launch and follow log output\n"
+           "  sigmund --tail <id>           follow log of running process\n"
+           "  sigmund -l, --list            list tracked processes\n"
+           "  sigmund stop <id>...          graceful stop (SIGTERM → SIGKILL)\n"
+           "  sigmund kill <id>...          immediate kill (SIGKILL)\n"
+           "  sigmund killcmd <id>...       print kill command for scripting\n"
+           "  sigmund prune                 remove dead records and logs\n",
+           SIGMUND_VERSION);
 }
 
 int main(int argc, char **argv) {
@@ -1161,11 +1224,34 @@ int main(int argc, char **argv) {
         die_errno("sigmund: failed to init storage");
     }
 
+    bool tail = false;
+    if (!strcmp(argv[1], "--tail")) {
+        if (argc < 3) {
+            usage();
+            return 5;
+        }
+        tail = true;
+        argc--;
+        argv++;
+    }
+
     if (!strcmp(argv[1], "--")) {
         if (argc < 3) {
             return 5;
         }
-        return perform_start(dir, persistent, argc - 2, argv + 2);
+        return perform_start(dir, persistent, tail, argc - 2, argv + 2);
+    }
+
+    if (tail && argc == 2) {
+        struct record r;
+        char path[1200];
+        if (valid_id(argv[1]) && load_record_by_id(dir, argv[1], &r, path, sizeof(path)) == 0) {
+            if (!r.has_log) {
+                fprintf(stderr, "sigmund: record has no log path: %s\n", argv[1]);
+                return 5;
+            }
+            return tail_log_until_exit(&r);
+        }
     }
 
     if (!strcmp(argv[1], "-l") || !strcmp(argv[1], "--list")) {
@@ -1235,5 +1321,5 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    return perform_start(dir, persistent, argc - 1, argv + 1);
+    return perform_start(dir, persistent, tail, argc - 1, argv + 1);
 }

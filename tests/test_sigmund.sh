@@ -73,6 +73,8 @@ test_lifecycle() {
   id=$(printf '%s\n' "$out" | extract_id)
   [ -n "$id" ] || return 1
   printf '%s\n' "$out" | grep -Eq 'pid=[0-9]+ pgid=[0-9]+ sid=[0-9]+'
+  printf '%s\n' "$out" | grep -Eq '^sigmund: log: .+/.+\\.log$'
+  printf '%s\n' "$out" | grep -Eq "^sigmund: stop: sigmund stop $id$"
   "$SIGMUND_BIN" -l | grep -Eq "^$id[[:space:]].*running"
   "$SIGMUND_BIN" stop "$id" >/dev/null
   "$SIGMUND_BIN" -l | grep -Eq "^$id[[:space:]].*dead"
@@ -81,6 +83,14 @@ test_lifecycle() {
   [ "$lines" -eq 1 ]
 }
 
+
+test_start_output_stop_hint() {
+  local out id
+  out=$("$SIGMUND_BIN" sleep 300 2>&1) || return 1
+  id=$(printf '%s\n' "$out" | extract_id)
+  [ -n "$id" ] || return 1
+  printf '%s\n' "$out" | grep -Eq "^sigmund: stop: sigmund stop $id$"
+}
 test_kill_subcommand() {
   local out id pgid
   out=$("$SIGMUND_BIN" sleep 300 2>&1) || return 1
@@ -236,6 +246,16 @@ test_log_capture() {
   grep -q 'out' "$log" && grep -q 'err' "$log"
 }
 
+
+
+test_tail_existing_id() {
+  local out id tailed
+  out=$("$SIGMUND_BIN" bash -c 'echo from_tail_id; sleep 0.2' 2>&1) || return 1
+  id=$(printf '%s\n' "$out" | extract_id)
+  [ -n "$id" ] || return 1
+  tailed=$("$SIGMUND_BIN" --tail "$id" 2>&1) || return 1
+  printf '%s\n' "$tailed" | grep -q 'from_tail_id'
+}
 test_concurrent_unique_ids() {
   local i id ids uniq
   ids=""
@@ -255,6 +275,7 @@ test_concurrent_unique_ids() {
 set -e
 run_test "start/stop lifecycle" test_lifecycle
 run_test "kill subcommand kills process group" test_kill_subcommand
+run_test "start output includes stop helper" test_start_output_stop_hint
 run_test "stop kills full process group (children)" test_group_kill_children
 run_test "exec failure creates no record" test_exec_failure_no_record
 run_test "fast exit command is recorded as dead" test_fast_exit_record_dead
@@ -266,7 +287,8 @@ run_test "killcmd prints group kill command" test_killcmd_output
 run_test "stop supports multiple IDs in one command" test_stop_multiple_ids
 run_test "argument edge cases" test_argument_edges
 run_test "special characters are preserved in argv JSON" test_special_chars_args
-run_test "non-interactive logging captures stdout+stderr" test_log_capture
+run_test "logging captures stdout+stderr" test_log_capture
+run_test "--tail <id> tails an existing run log" test_tail_existing_id
 run_test "concurrent starts produce unique ids" test_concurrent_unique_ids
 
 if [ "$FAILS" -ne 0 ]; then
