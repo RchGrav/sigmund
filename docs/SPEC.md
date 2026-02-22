@@ -36,7 +36,20 @@ Default output (human):
 
 ```
 sigmund: id=7f3c2a pid=12345 pgid=12345 sid=12345
+sigmund: log: /path/to/7f3c2a.log
+sigmund: stop: sigmund stop 7f3c2a
 ```
+
+### Tail
+
+    sigmund --tail <cmd> [args...]
+    sigmund --tail <id>
+
+`sigmund --tail <cmd> [args...]` launches the command identically to `sigmund <cmd>` (backgrounded, log file, new session), then tails the log file to stdout.
+
+`sigmund --tail <id>` tails the log for an already-running tracked process.
+
+Ctrl-C detaches from tailing — the background process keeps running.
 
 ### List
 
@@ -112,23 +125,16 @@ kill -TERM -- -<pgid>
 
 ---
 
-## Stdio policy (KISS, no flags)
-
-`sigmund` uses TTY detection to decide whether to keep output on the console or redirect it to a log file.
+## Stdio policy
 
 * `stdin` is always redirected from `/dev/null`.
-* If both `stdout` and `stderr` are TTYs (`isatty(1)` and `isatty(2)`):
+* `stdout` and `stderr` are always redirected to a per-run log file: `<storage_dir>/<id>.log`.
 
-  * `stdout`/`stderr` are inherited (live console output).
-* Otherwise (non-interactive; e.g., CI pipes/log collectors):
+Start output always includes the log path and a stop command:
 
-  * `stdout` and `stderr` are redirected to a per-run log file: `<storage_dir>/<id>.log`.
-
-When redirection is used, start output includes the log path:
-
-```
-sigmund: log: /path/to/<id>.log
-```
+    sigmund: id=<id> pid=<pid> pgid=<pgid> sid=<sid>
+    sigmund: log: /path/to/<id>.log
+    sigmund: stop: sigmund stop <id>
 
 ---
 
@@ -171,7 +177,7 @@ Required fields:
 * `argv` (array of strings)
 * `uid` (int)
 * `gid` (int)
-* `log_path` (string; present if redirection is used)
+* `log_path` (string)
 * `boot_id` (string; Linux; required when not using `$XDG_RUNTIME_DIR`)
 
 Linux identity fields (best-effort; required for “safe stop” when available):
@@ -220,10 +226,7 @@ A pipe is used to distinguish “exec succeeded” from “exec failed” withou
 
    * `setsid()`; on failure, write `errno` to pipe and `_exit(127)`.
    * Open `/dev/null` and `dup2` to `STDIN_FILENO`.
-   * Apply stdio policy:
-
-     * If interactive TTY (stdout and stderr are TTYs): inherit stdout/stderr.
-     * Otherwise: open log file and `dup2` it to `STDOUT_FILENO` and `STDERR_FILENO`.
+   * Open log file and `dup2` it to `STDOUT_FILENO` and `STDERR_FILENO`.
    * `execvp(argv[0], argv)`.
    * On exec failure: write `errno` to pipe; `_exit(127)`.
 7. Parent process:
@@ -245,7 +248,7 @@ A pipe is used to distinguish “exec succeeded” from “exec failed” withou
      * `stat("/proc/<pid>/exe")` to capture `(st_dev, st_ino)` when permitted.
      * If `/proc` reads return `ENOENT` (fast exit after exec), treat as non-fatal and write the record with missing identity fields set to 0.
    * Write record atomically.
-   * Print start output (and log path if redirected).
+   * Print start output including id/pid/pgid/sid, log path, and stop command.
 
 ---
 
@@ -321,5 +324,5 @@ After stopping, session-based diagnostics may be emitted:
 ## Build and compatibility
 
 * Language: C11
-* Requires POSIX APIs: `fork`, `execvp`, `setsid`, `kill`, `waitpid`, `open`, `dup2`, `pipe/pipe2`, `fcntl`, `stat`, `rename`, `fsync`, `nanosleep`, `isatty`
+* Requires POSIX APIs: `fork`, `execvp`, `setsid`, `kill`, `waitpid`, `open`, `dup2`, `pipe/pipe2`, `fcntl`, `stat`, `rename`, `fsync`, `nanosleep`
 * Linux enhancements: `/proc` parsing, `boot_id`, optional `getrandom()` (fallback `/dev/urandom`)

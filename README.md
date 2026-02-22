@@ -32,6 +32,7 @@ make
 $ sigmund qemu-system-x86_64 -m 4096 -nographic
 sigmund: id=7f3c2a pid=4012 pgid=4012 sid=4012
 sigmund: log: /run/user/1000/sigmund/7f3c2a.log
+sigmund: stop: sigmund stop 7f3c2a
 
 # List tracked runs
 $ sigmund -l
@@ -97,13 +98,19 @@ sigmund -l
 | `sigmund prune`        | Cleans up the state files and logs for processes that are natively `dead`.                     |
 | `sigmund killcmd <id>` | Prints the raw shell command needed to signal the process group (e.g., `kill -TERM -- -4012`). |
 
-## Smart Stdio & Logging (KISS)
+## Stdio & Logging
 
-`sigmund` handles I/O dynamically based on your environment:
+`sigmund` always captures child process output:
 
-* `stdin` is always safely redirected from `/dev/null`.
-* **Interactive (TTY):** If you run `sigmund` in a standard terminal, `stdout` and `stderr` stay on your console so you can see immediate startup errors.
-* **Non-interactive (CI/Scripts):** If run in a pipeline or redirected, `sigmund` automatically routes `stdout` and `stderr` to a dedicated per-run log file stored next to the state record. The log path is printed to standard output upon successful launch.
+* `stdin` is always redirected from `/dev/null`.
+* `stdout` and `stderr` are always redirected to a dedicated per-run log file stored next to the state record.
+* Start output always includes the log path and a ready-to-run stop command.
+
+Use `sigmund --tail <cmd> [args...]` to launch exactly the same way and then follow the log in your terminal.
+
+Use `sigmund --tail <id>` to follow the log of an already-running tracked process.
+
+Press Ctrl-C to detach from tailing while the background process keeps running.
 
 ## Architecture & Safety Guarantees
 
