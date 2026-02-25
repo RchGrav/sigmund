@@ -21,10 +21,21 @@ Many CI runners (like GitHub Actions or GitLab CI) and non-interactive job syste
 
 **Build:**
 Requires a C11 compiler. Linux-first (relies on `/proc` for identity validation).
+
+By default, `make` produces a **static** standalone binary (`-static`) so it does not depend on the host glibc version at runtime.
+
 ```bash
 make
 ./sigmund --help
+
+# Optional: build a dynamically linked binary instead (smaller, host-glibc dependent)
+make sigmund-dynamic
 ```
+
+For cross-platform CI and releases, build and publish both variants:
+
+- Static artifact (`make`): best portability across Linux hosts.
+- Dynamic artifact (`make sigmund-dynamic`): smaller binary when runtime glibc compatibility is acceptable.
 
 **Basic Usage:**
 ```bash
