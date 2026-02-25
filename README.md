@@ -123,7 +123,7 @@ sigmund list
 
 | Switch        | Description                               |
 |---------------|-------------------------------------------|
-| `--tail`      | Equivalent to `sigmund --tail <cmd...>`. |
+| `--tail`      | Launches a command and immediately streams its log output. |
 
 > **Note:** `--` is an argument separator, not a switch. Use it when your command name could be interpreted as a `sigmund` command. Example: `sigmund -- list`.
 

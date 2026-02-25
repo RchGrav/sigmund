@@ -1487,9 +1487,9 @@ static int cmd_prune(const char *dir) {
 
 static void usage(void) {
     printf("sigmund %s — More than nohup, less than systemd.\n\n"
-           "usage:\n"
+           "start forms:\n"
            "  sigmund <cmd...>              launch command in background\n"
-           "  sigmund --tail <cmd...>       launch and follow log output\n"
+           "  sigmund --tail <cmd...>       launch command and stream log output\n"
            "\n"
            "commands:\n"
            "  sigmund list                  list tracked processes\n"
@@ -1500,7 +1500,7 @@ static void usage(void) {
            "  sigmund prune                 remove dead records and logs\n"
            "\n"
            "switches:\n"
-           "  --tail                        launch and stream command log output\n"
+           "  --tail                        start-mode switch (use with <cmd...>)\n"
            "\n"
            "note:\n"
            "  Use 'sigmund -- <cmd...>' to run a command whose name overlaps\n"
