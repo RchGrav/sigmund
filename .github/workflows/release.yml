@@ -35,13 +35,10 @@ jobs:
         include:
           - target: linux-amd64-gnu
             dockcross_image: ""
-            cc: gcc
           - target: linux-arm64-gnu
             dockcross_image: dockcross/linux-arm64
-            cc: aarch64-linux-gnu-gcc
           - target: linux-armhf-gnu
             dockcross_image: dockcross/linux-armv7
-            cc: arm-linux-gnueabihf-gcc
     steps:
       - uses: actions/checkout@v4
 
@@ -59,14 +56,14 @@ jobs:
         if: matrix.dockcross_image == ''
         run: |
           make clean
-          make CC="${{ matrix.cc }}"
+          make
 
       - name: Build binary (dockcross GNU)
         if: matrix.dockcross_image != ''
         run: |
           docker run --rm "${{ matrix.dockcross_image }}" > dockcross
           chmod +x dockcross
-          ./dockcross bash -lc "make clean && make CC='${{ matrix.cc }}'"
+          ./dockcross bash -lc "make clean && make"
 
       - name: Package tarball
         run: |
