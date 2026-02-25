@@ -1500,7 +1500,6 @@ static void usage(void) {
            "  sigmund prune                 remove dead records and logs\n"
            "\n"
            "switches:\n"
-           "  -l, --list                    alias for 'sigmund list'\n"
            "  --tail                        launch and stream command log output\n"
            "\n"
            "note:\n"
@@ -1565,7 +1564,7 @@ int main(int argc, char **argv) {
         return tail_log_until_exit(&r, true);
     }
 
-    if (!strcmp(argv[argi], "list") || !strcmp(argv[argi], "-l") || !strcmp(argv[argi], "--list")) {
+    if (!strcmp(argv[argi], "list")) {
         return cmd_list(dir);
     }
     if (!strcmp(argv[argi], "prune")) {

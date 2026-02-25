@@ -220,6 +220,16 @@ test_argument_edges() {
   "$SIGMUND_BIN" --help >/dev/null || return 1
   out=$("$SIGMUND_BIN" --version) || return 1
   printf '%s\n' "$out" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'
+  set +e
+  "$SIGMUND_BIN" -l >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -eq 1 ] || return 1
+  set +e
+  "$SIGMUND_BIN" --list >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -eq 1 ] || return 1
   "$SIGMUND_BIN" -- sleep 1 >/dev/null
 }
 

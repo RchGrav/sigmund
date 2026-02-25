@@ -121,9 +121,8 @@ sigmund list
 
 ### Switches
 
-| Switch        | Description                    |
-|---------------|--------------------------------|
-| `-l`, `--list`| Alias for `sigmund list`.      |
+| Switch        | Description                               |
+|---------------|-------------------------------------------|
 | `--tail`      | Equivalent to `sigmund --tail <cmd...>`. |
 
 > **Note:** `--` is an argument separator, not a switch. Use it when your command name could be interpreted as a `sigmund` command. Example: `sigmund -- list`.
