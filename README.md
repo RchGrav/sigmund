@@ -135,7 +135,6 @@ If any check fails, the state evaluates as `stale` and signals are blocked.
 * Harden edge cases in CI runners:
   * exec-handshake reliability
   * leader-exits-but-group-lives behavior
-  * consistent state handling with `$XDG_RUNTIME_DIR`
 * Optional Linux-only diagnostics:
   * session-ID scan to warn on group escapes
 
