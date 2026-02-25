@@ -1,33 +1,173 @@
-name: Release
+name: Multi-arch Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
 
 jobs:
-  release:
+  test:
+    name: Test (ubuntu amd64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build static binary for portable Linux distribution
+      - name: Build
         run: |
           make clean
-          make CC=gcc CFLAGS="-std=c11 -Wall -Wextra -Wpedantic -O2 -static -s"
-      - name: Verify static build with full regression suite
+          make
+      - name: Run test suite
         run: make test
-      - name: Prepare release artifacts
+
+  build-gnu:
+    name: Build GNU (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64-gnu
+            dockcross_image: ""
+            cc: gcc
+          - target: linux-arm64-gnu
+            dockcross_image: dockcross/linux-arm64
+            cc: aarch64-linux-gnu-gcc
+          - target: linux-armhf-gnu
+            dockcross_image: dockcross/linux-armv7
+            cc: arm-linux-gnueabihf-gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
         run: |
-          mv sigmund sigmund-linux-x86_64
-          sha256sum sigmund-linux-x86_64 > sigmund-linux-x86_64.sha256
-      - name: Publish GitHub release with generated notes and artifacts
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0-${GITHUB_SHA::7}"
+          fi
+          echo "value=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Build binary (native GNU)
+        if: matrix.dockcross_image == ''
+        run: |
+          make clean
+          make CC="${{ matrix.cc }}"
+
+      - name: Build binary (dockcross GNU)
+        if: matrix.dockcross_image != ''
+        run: |
+          docker run --rm "${{ matrix.dockcross_image }}" > dockcross
+          chmod +x dockcross
+          ./dockcross bash -lc "make clean && make CC='${{ matrix.cc }}'"
+
+      - name: Package tarball
+        run: |
+          mkdir -p dist
+          ./.github/scripts/package_tarball.sh "${{ matrix.target }}" "${{ steps.version.outputs.value }}" sigmund dist
+
+      - name: Upload GNU artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  build-musl:
+    name: Build musl (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64-musl
+            zig_target: x86_64-linux-musl
+          - target: linux-arm64-musl
+            zig_target: aarch64-linux-musl
+          - target: linux-armhf-musl
+            zig_target: arm-linux-musleabihf
+          - target: linux-i386-musl
+            zig_target: i386-linux-musl
+          - target: linux-mips-musl
+            zig_target: mips-linux-musl
+          - target: linux-mipsel-musl
+            zig_target: mipsel-linux-musl
+          - target: linux-riscv64-musl
+            zig_target: riscv64-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" == v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0-${GITHUB_SHA::7}"
+          fi
+          echo "value=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned Zig
+        env:
+          ZIG_VERSION: 0.13.0
+        run: |
+          curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-x86_64-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
+          tar -xf zig.tar.xz
+          mv "zig-linux-x86_64-${ZIG_VERSION}" zig
+          echo "${PWD}/zig" >> "$GITHUB_PATH"
+
+      - name: Build musl binary (static preferred, dynamic fallback)
+        run: |
+          make clean
+          if ! make CC='zig cc -target ${{ matrix.zig_target }}' CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O2 -s -static'; then
+            echo "Static build failed for ${{ matrix.target }}; retrying without -static"
+            make clean
+            make CC='zig cc -target ${{ matrix.zig_target }}' CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O2 -s'
+          fi
+
+      - name: Package tarball
+        run: |
+          mkdir -p dist
+          ./.github/scripts/package_tarball.sh "${{ matrix.target }}" "${{ steps.version.outputs.value }}" sigmund dist
+
+      - name: Upload musl artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - build-gnu
+      - build-musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum sigmund-*.tar.gz > SHA256SUMS
+
+      - name: Publish release artifacts
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
           generate_release_notes: true
           files: |
-            sigmund-linux-x86_64
-            sigmund-linux-x86_64.sha256
+            dist/sigmund-*.tar.gz
+            dist/SHA256SUMS
