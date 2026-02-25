@@ -19,10 +19,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build
+      - name: Build static and dynamic
         run: |
           make clean
           make
+          make clean
+          make sigmund-dynamic
       - name: Run test suite
         run: make test
 
@@ -33,12 +35,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: linux-amd64-gnu
+          - target: linux-amd64-gnu-static
             dockcross_image: ""
-          - target: linux-arm64-gnu
+            make_target: sigmund
+            static_ldflags: -static
+          - target: linux-amd64-gnu-dynamic
+            dockcross_image: ""
+            make_target: sigmund-dynamic
+            static_ldflags: ''
+          - target: linux-arm64-gnu-static
             dockcross_image: dockcross/linux-arm64
-          - target: linux-armhf-gnu
+            make_target: sigmund
+            static_ldflags: -static
+          - target: linux-arm64-gnu-dynamic
+            dockcross_image: dockcross/linux-arm64
+            make_target: sigmund-dynamic
+            static_ldflags: ''
+          - target: linux-armhf-gnu-static
             dockcross_image: dockcross/linux-armv7
+            make_target: sigmund
+            static_ldflags: -static
+          - target: linux-armhf-gnu-dynamic
+            dockcross_image: dockcross/linux-armv7
+            make_target: sigmund-dynamic
+            static_ldflags: ''
     steps:
       - uses: actions/checkout@v4
 
@@ -56,14 +76,14 @@ jobs:
         if: matrix.dockcross_image == ''
         run: |
           make clean
-          make
+          make ${{ matrix.make_target }} STATIC_LDFLAGS='${{ matrix.static_ldflags }}'
 
       - name: Build binary (dockcross GNU)
         if: matrix.dockcross_image != ''
         run: |
           docker run --rm "${{ matrix.dockcross_image }}" > dockcross
           chmod +x dockcross
-          ./dockcross bash -lc "make clean && make"
+          ./dockcross bash -lc "make clean && make ${{ matrix.make_target }} STATIC_LDFLAGS='${{ matrix.static_ldflags }}'"
 
       - name: Package tarball
         run: |
@@ -84,15 +104,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: linux-amd64-musl
+          - target: linux-amd64-musl-static
             zig_target: x86_64-linux-musl
-          - target: linux-arm64-musl
+          - target: linux-arm64-musl-static
             zig_target: aarch64-linux-musl
-          - target: linux-armhf-musl
+          - target: linux-armhf-musl-static
             zig_target: arm-linux-musleabihf
-          - target: linux-mipsel-musl
+          - target: linux-mipsel-musl-static
             zig_target: mipsel-linux-musl
-          - target: linux-riscv64-musl
+          - target: linux-riscv64-musl-static
             zig_target: riscv64-linux-musl
     steps:
       - uses: actions/checkout@v4
@@ -116,14 +136,10 @@ jobs:
           mv "zig-linux-x86_64-${ZIG_VERSION}" zig
           echo "${PWD}/zig" >> "$GITHUB_PATH"
 
-      - name: Build musl binary (static preferred, dynamic fallback)
+      - name: Build musl static binary
         run: |
           make clean
-          if ! make CC='zig cc -target ${{ matrix.zig_target }}' CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O2 -s -static'; then
-            echo "Static build failed for ${{ matrix.target }}; retrying without -static"
-            make clean
-            make CC='zig cc -target ${{ matrix.zig_target }}' CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O2 -s'
-          fi
+          make CC='zig cc -target ${{ matrix.zig_target }}' CFLAGS='-std=c11 -Wall -Wextra -Wpedantic -O2 -s' STATIC_LDFLAGS='-static'
 
       - name: Package tarball
         run: |
