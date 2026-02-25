@@ -93,8 +93,6 @@ jobs:
             zig_target: aarch64-linux-musl
           - target: linux-armhf-musl
             zig_target: arm-linux-musleabihf
-          - target: linux-i386-musl
-            zig_target: i386-linux-musl
           - target: linux-mips-musl
             zig_target: mips-linux-musl
           - target: linux-mipsel-musl
