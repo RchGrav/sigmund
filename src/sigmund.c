@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -23,6 +24,13 @@
 #define STOP_TIMEOUT_MS 5000
 #define POLL_SLEEP_MS 25
 #define SIGMUND_VERSION "0.1.0"
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+#define SIGMUND_PATH_MAX PATH_MAX
+#ifndef SIGMUND_BOOT_ID_PATH
+#define SIGMUND_BOOT_ID_PATH "/proc/sys/kernel/random/boot_id"
+#endif
 
 struct record {
     int version;
@@ -33,12 +41,12 @@ struct record {
     int64_t start_unix_ns;
     uid_t uid;
     gid_t gid;
-    char log_path[1024];
+    char log_path[SIGMUND_PATH_MAX];
     char boot_id[128];
     uint64_t proc_starttime_ticks;
     uint64_t exe_dev;
     uint64_t exe_ino;
-    char cmdline[1024];
+    char cmdline[SIGMUND_PATH_MAX];
     bool has_log;
     bool has_boot;
 };
@@ -46,6 +54,7 @@ struct record {
 enum run_state { STATE_RUNNING, STATE_DEAD, STATE_STALE, STATE_UNKNOWN };
 
 static volatile sig_atomic_t g_tail_interrupted = 0;
+static int write_all(int fd, const void *buf, size_t n);
 
 static void handle_tail_sigint(int signo) {
     (void)signo;
@@ -88,12 +97,31 @@ static bool valid_id(const char *id) {
     return true;
 }
 
+static bool is_hidden_id_artifact(const char *name, const char *suffix) {
+    size_t nl = strlen(name);
+    size_t sl = strlen(suffix);
+    if (nl <= 1 + sl || name[0] != '.') {
+        return false;
+    }
+    if (strcmp(name + (nl - sl), suffix) != 0) {
+        return false;
+    }
+    size_t id_len = nl - 1 - sl;
+    if (id_len >= 32) {
+        return false;
+    }
+    char id[32];
+    memcpy(id, name + 1, id_len);
+    id[id_len] = '\0';
+    return valid_id(id);
+}
+
 static bool valid_record(const struct record *r) {
     return r->pid > 0 && r->pgid > 1 && r->id[0] != '\0';
 }
 
 static int mkdir_p0700(const char *dir) {
-    char path[1200];
+    char path[SIGMUND_PATH_MAX];
     if (checked_snprintf(path, sizeof(path), "%s", dir) != 0) {
         return -1;
     }
@@ -150,26 +178,46 @@ static int read_file_trim(const char *path, char *buf, size_t n) {
 }
 
 static int get_boot_id(char *buf, size_t n) {
-    return read_file_trim("/proc/sys/kernel/random/boot_id", buf, n);
+    return read_file_trim(SIGMUND_BOOT_ID_PATH, buf, n);
 }
 
 static int rand_bytes(uint8_t *buf, size_t n) {
-    ssize_t r = getrandom(buf, n, 0);
-    if (r == (ssize_t)n) {
+    size_t off = 0;
+    bool fallback = false;
+    while (off < n && !fallback) {
+        ssize_t r = getrandom(buf + off, n - off, 0);
+        if (r > 0) {
+            off += (size_t)r;
+            continue;
+        }
+        if (r < 0 && errno == EINTR) {
+            continue;
+        }
+        if (r < 0 && (errno == ENOSYS || errno == EINVAL)) {
+            fallback = true;
+            break;
+        }
+        return -1;
+    }
+    if (!fallback) {
         return 0;
     }
+
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) {
         return -1;
     }
-    size_t off = 0;
     while (off < n) {
         ssize_t x = read(fd, buf + off, n - off);
-        if (x <= 0) {
-            close(fd);
-            return -1;
+        if (x > 0) {
+            off += (size_t)x;
+            continue;
         }
-        off += (size_t)x;
+        if (x < 0 && errno == EINTR) {
+            continue;
+        }
+        close(fd);
+        return -1;
     }
     close(fd);
     return 0;
@@ -177,7 +225,7 @@ static int rand_bytes(uint8_t *buf, size_t n) {
 
 static int gen_id(const char *dir, char *out, size_t out_n) {
     uint8_t b[ID_HEX_LEN / 2];
-    char path[1200];
+    char reserve[SIGMUND_PATH_MAX];
     for (int tries = 0; tries < 100; tries++) {
         if (rand_bytes(b, sizeof(b)) != 0) {
             return -1;
@@ -185,45 +233,114 @@ static int gen_id(const char *dir, char *out, size_t out_n) {
         for (size_t i = 0; i < sizeof(b); i++) {
             snprintf(out + i * 2, out_n - i * 2, "%02x", b[i]);
         }
-        if (checked_snprintf(path, sizeof(path), "%s/%s.json", dir, out) != 0) {
+        if (checked_snprintf(reserve, sizeof(reserve), "%s/.%s.reserve", dir, out) != 0) {
             return -1;
         }
-        if (access(path, F_OK) != 0) {
+        int fd = open(reserve, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd >= 0) {
+            close(fd);
             return 0;
         }
+        if (errno != EEXIST) {
+            return -1;
+        }
     }
+    errno = EEXIST;
     return -1;
 }
 
-static int ensure_storage(char *dir, size_t n, bool *persistent) {
-    const char *xdg_runtime = getenv("XDG_RUNTIME_DIR");
-    if (xdg_runtime && *xdg_runtime) {
-        if (checked_snprintf(dir, n, "%s/sigmund", xdg_runtime) != 0) {
-            return -1;
-        }
-        if (mkdir_p0700(dir) == 0) {
-            *persistent = false;
-            return 0;
-        }
+static int ensure_storage(char *dir, size_t n) {
+    const char *home = getenv("HOME");
+    if (!home || !*home) {
+        fprintf(stderr, "sigmund: error: HOME is not set\n");
+        errno = EINVAL;
+        return -1;
     }
-    const char *xdg_state = getenv("XDG_STATE_HOME");
-    if (xdg_state && *xdg_state) {
-        if (checked_snprintf(dir, n, "%s/sigmund", xdg_state) != 0) {
-            return -1;
-        }
-    } else {
-        const char *home = getenv("HOME");
-        if (!home || !*home) {
-            return -1;
-        }
-        if (checked_snprintf(dir, n, "%s/.local/state/sigmund", home) != 0) {
-            return -1;
-        }
+    if (checked_snprintf(dir, n, "%s/.local/state/sigmund", home) != 0) {
+        return -1;
     }
     if (mkdir_p0700(dir) != 0) {
         return -1;
     }
-    *persistent = true;
+    if (chmod(dir, 0700) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int maybe_cleanup_for_boot(const char *dir) {
+    char current_boot[128];
+    if (get_boot_id(current_boot, sizeof(current_boot)) != 0) {
+        return 0;
+    }
+    char marker[SIGMUND_PATH_MAX];
+    if (checked_snprintf(marker, sizeof(marker), "%s/.boot_id", dir) != 0) {
+        return -1;
+    }
+    char prev_boot[128] = {0};
+    bool had_marker = read_file_trim(marker, prev_boot, sizeof(prev_boot)) == 0 && prev_boot[0] != '\0';
+    bool should_write_marker = !had_marker;
+    if (had_marker && strcmp(prev_boot, current_boot) != 0) {
+        should_write_marker = true;
+        DIR *d = opendir(dir);
+        if (!d) {
+            return -1;
+        }
+        const struct dirent *e;
+        while ((e = readdir(d))) {
+            const char *name = e->d_name;
+            if (!strcmp(name, ".") || !strcmp(name, "..") || !strcmp(name, ".boot_id")) {
+                continue;
+            }
+            bool rm = has_suffix(name, ".json") || has_suffix(name, ".log") ||
+                      is_hidden_id_artifact(name, ".reserve") ||
+                      is_hidden_id_artifact(name, ".tmp");
+            if (rm) {
+                char p[SIGMUND_PATH_MAX];
+                if (checked_snprintf(p, sizeof(p), "%s/%s", dir, name) == 0) {
+                    unlink(p);
+                }
+            }
+        }
+        closedir(d);
+    }
+    if (!should_write_marker) {
+        return 0;
+    }
+
+    char marker_tmp[SIGMUND_PATH_MAX];
+    if (checked_snprintf(marker_tmp, sizeof(marker_tmp), "%s/.boot_id.tmp", dir) != 0) {
+        return -1;
+    }
+    int fd = open(marker_tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        return -1;
+    }
+    if (write_all(fd, current_boot, strlen(current_boot)) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (fchmod(fd, 0600) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (fsync(fd) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    if (rename(marker_tmp, marker) != 0) {
+        int re = errno;
+        unlink(marker_tmp);
+        if (re == ENOENT || re == EEXIST) {
+            char chk[128] = {0};
+            if (read_file_trim(marker, chk, sizeof(chk)) == 0 && strcmp(chk, current_boot) == 0) {
+                return 0;
+            }
+        }
+        errno = re;
+        return -1;
+    }
     return 0;
 }
 
@@ -280,22 +397,29 @@ static int write_json_argv(FILE *f, int argc, char **argv) {
 }
 
 static int write_record_atomic(const char *dir, const struct record *r, int argc, char **argv, char *out_json_path, size_t out_n) {
-    char tmp[1200], fin[1200];
+    char tmp[SIGMUND_PATH_MAX], fin[SIGMUND_PATH_MAX], reserve[SIGMUND_PATH_MAX];
+    int rc = -1;
+    int fd = -1;
+    FILE *f = NULL;
     if (checked_snprintf(fin, sizeof(fin), "%s/%s.json", dir, r->id) != 0) {
         return -1;
     }
-    if (checked_snprintf(tmp, sizeof(tmp), "%s/.%s.tmp.%ld", dir, r->id, (long)getpid()) != 0) {
+    if (checked_snprintf(tmp, sizeof(tmp), "%s/.%s.tmp", dir, r->id) != 0) {
+        return -1;
+    }
+    if (checked_snprintf(reserve, sizeof(reserve), "%s/.%s.reserve", dir, r->id) != 0) {
         return -1;
     }
 
-    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0) {
         return -1;
     }
-    FILE *f = fdopen(fd, "w");
+    f = fdopen(fd, "w");
     if (!f) {
         close(fd);
-        return -1;
+        fd = -1;
+        goto out;
     }
 
     fprintf(f, "{\n");
@@ -332,28 +456,40 @@ static int write_record_atomic(const char *dir, const struct record *r, int argc
 
     fflush(f);
     if (fsync(fd) != 0) {
-        fclose(f);
-        unlink(tmp);
-        return -1;
+        goto out;
     }
-    fclose(f);
+    if (fclose(f) != 0) {
+        f = NULL;
+        goto out;
+    }
+    f = NULL;
+    fd = -1;
     if (rename(tmp, fin) != 0) {
-        unlink(tmp);
-        return -1;
+        goto out;
     }
+    unlink(reserve);
     int dfd = open(dir, O_RDONLY | O_DIRECTORY);
-    if (dfd < 0) {
-        return -1;
-    }
-    if (fsync(dfd) != 0) {
+    if (dfd >= 0) {
+        if (fsync(dfd) != 0) {
+            fprintf(stderr, "sigmund: warning: failed to fsync storage dir: %s\n", strerror(errno));
+        }
         close(dfd);
-        return -1;
     }
-    close(dfd);
     if (out_json_path && checked_snprintf(out_json_path, out_n, "%s", fin) != 0) {
-        return -1;
+        goto out;
     }
-    return 0;
+    rc = 0;
+
+out:
+    if (f) {
+        fclose(f);
+    } else if (fd >= 0) {
+        close(fd);
+    }
+    if (rc != 0) {
+        unlink(tmp);
+    }
+    return rc;
 }
 
 static int append_cmd_escaped(char *dst, size_t n, size_t *off, const char *arg) {
@@ -551,21 +687,211 @@ static int group_exists(pid_t pgid) {
     return -1;
 }
 
-static int json_find_key(const char *j, const char *k, const char **v) {
-    char pat[64];
-    if (checked_snprintf(pat, sizeof(pat), "\n  \"%s\":", k) != 0) {
-        return -1;
-    }
-    const char *p = strstr(j, pat);
-    if (!p) {
-        return -1;
-    }
-    p += strlen(pat);
-    while (*p && isspace((unsigned char)*p)) {
+static const char *skip_ws(const char *p) {
+    while (*p && isspace((unsigned char)*p)) p++;
+    return p;
+}
+
+static int skip_json_string(const char **pp) {
+    const char *p = *pp;
+    if (*p != '"') return -1;
+    p++;
+    while (*p) {
+        if (*p == '"') {
+            *pp = p + 1;
+            return 0;
+        }
+        if (*p == '\\') {
+            p++;
+            if (!*p) return -1;
+            if (*p == 'u') {
+                for (int i = 0; i < 4; i++) {
+                    p++;
+                    if (!isxdigit((unsigned char)*p)) return -1;
+                }
+            }
+        }
         p++;
     }
-    *v = p;
+    return -1;
+}
+
+/* BMP-only; surrogate pairs are rejected. */
+static int parse_json_string(const char *p, char *out, size_t n, const char **endp) {
+    if (*p != '"') return -1;
+    p++;
+    size_t i = 0;
+    while (*p) {
+        if (*p == '"') {
+            if (i >= n) return -1;
+            out[i] = '\0';
+            if (endp) *endp = p + 1;
+            return 0;
+        }
+        if (*p == '\\') {
+            p++;
+            if (!*p) return -1;
+            char c = *p;
+            switch (*p) {
+            case 'n': c = '\n'; break;
+            case 't': c = '\t'; break;
+            case 'r': c = '\r'; break;
+            case 'b': c = '\b'; break;
+            case 'f': c = '\f'; break;
+            case '\\': case '"': case '/': break;
+            case 'u': {
+                unsigned v = 0;
+                for (int j = 0; j < 4; j++) {
+                    p++;
+                    if (!isxdigit((unsigned char)*p)) return -1;
+                    v = (v << 4) + (unsigned)(isdigit((unsigned char)*p) ? *p - '0' : (tolower((unsigned char)*p) - 'a' + 10));
+                }
+                if (v == 0) return -1;
+                if (v >= 0xD800 && v <= 0xDFFF) return -1;
+                if (v <= 0x7F) {
+                    c = (char)v;
+                    if (i + 1 >= n) return -1;
+                    out[i++] = c;
+                } else if (v <= 0x7FF) {
+                    if (i + 2 >= n) return -1;
+                    out[i++] = (char)(0xC0 | (v >> 6));
+                    out[i++] = (char)(0x80 | (v & 0x3F));
+                } else {
+                    if (i + 3 >= n) return -1;
+                    out[i++] = (char)(0xE0 | (v >> 12));
+                    out[i++] = (char)(0x80 | ((v >> 6) & 0x3F));
+                    out[i++] = (char)(0x80 | (v & 0x3F));
+                }
+                p++;
+                continue;
+            }
+            default: return -1;
+            }
+            if (i + 1 >= n) return -1;
+            out[i++] = c;
+            p++;
+            continue;
+        }
+        if (i + 1 >= n) return -1;
+        out[i++] = *p++;
+    }
+    return -1;
+}
+
+static int skip_json_value(const char **pp);
+
+static int match_json_string(const char *p, const char *lit, const char **endp, bool *matched) {
+    if (*p != '"') return -1;
+    p++;
+    size_t li = 0;
+    bool ok = true;
+    while (*p) {
+        if (*p == '"') {
+            if (lit[li] != '\0') {
+                ok = false;
+            }
+            if (endp) *endp = p + 1;
+            if (matched) *matched = ok;
+            return 0;
+        }
+        unsigned cp = 0;
+        if (*p == '\\') {
+            p++;
+            if (!*p) return -1;
+            switch (*p) {
+            case 'n': cp = '\n'; p++; break;
+            case 't': cp = '\t'; p++; break;
+            case 'r': cp = '\r'; p++; break;
+            case 'b': cp = '\b'; p++; break;
+            case 'f': cp = '\f'; p++; break;
+            case '\\': cp = '\\'; p++; break;
+            case '"': cp = '"'; p++; break;
+            case '/': cp = '/'; p++; break;
+            case 'u': {
+                unsigned v = 0;
+                for (int j = 0; j < 4; j++) {
+                    p++;
+                    if (!isxdigit((unsigned char)*p)) return -1;
+                    v = (v << 4) + (unsigned)(isdigit((unsigned char)*p) ? *p - '0' : (tolower((unsigned char)*p) - 'a' + 10));
+                }
+                if (v == 0 || (v >= 0xD800 && v <= 0xDFFF)) return -1;
+                cp = v;
+                p++;
+                break;
+            }
+            default:
+                return -1;
+            }
+        } else {
+            cp = (unsigned char)*p;
+            p++;
+        }
+
+        if (cp <= 0x7F) {
+            if (lit[li] == '\0' || (unsigned char)lit[li] != cp) {
+                ok = false;
+            }
+            if (lit[li] != '\0') {
+                li++;
+            }
+        } else {
+            ok = false;
+        }
+    }
+    return -1;
+}
+
+static int skip_json_value(const char **pp) {
+    const char *p = skip_ws(*pp);
+    if (*p == '"') {
+        if (skip_json_string(&p) != 0) return -1;
+        *pp = p;
+        return 0;
+    }
+    if (*p == '{' || *p == '[') {
+        char open = *p, close = (open == '{') ? '}' : ']';
+        p++;
+        while (*p) {
+            p = skip_ws(p);
+            if (*p == close) { *pp = p + 1; return 0; }
+            if (open == '{') {
+                if (skip_json_string(&p) != 0) return -1;
+                p = skip_ws(p);
+                if (*p != ':') return -1;
+                p++;
+            }
+            if (skip_json_value(&p) != 0) return -1;
+            p = skip_ws(p);
+            if (*p == ',') p++;
+        }
+        return -1;
+    }
+    while (*p && !isspace((unsigned char)*p) && *p != ',' && *p != '}' && *p != ']') p++;
+    *pp = p;
     return 0;
+}
+
+static int json_find_key(const char *j, const char *k, const char **v) {
+    const char *p = skip_ws(j);
+    if (*p != '{') return -1;
+    p++;
+    while (*p) {
+        p = skip_ws(p);
+        if (*p == '}') return -1;
+        bool key_match = false;
+        if (match_json_string(p, k, &p, &key_match) != 0) return -1;
+        p = skip_ws(p);
+        if (*p != ':') return -1;
+        p = skip_ws(p + 1);
+        if (key_match) {
+            *v = p;
+            return 0;
+        }
+        if (skip_json_value(&p) != 0) return -1;
+        p = skip_ws(p);
+        if (*p == ',') p++;
+    }
+    return -1;
 }
 
 static int json_get_i64(const char *j, const char *k, int64_t *out) {
@@ -573,7 +899,14 @@ static int json_get_i64(const char *j, const char *k, int64_t *out) {
     if (json_find_key(j, k, &v) != 0) {
         return -1;
     }
-    *out = strtoll(v, NULL, 10);
+    if (*v == '+') return -1;
+    char *end = NULL;
+    errno = 0;
+    long long x = strtoll(v, &end, 10);
+    if (end == v || errno != 0) return -1;
+    end = (char *)skip_ws(end);
+    if (*end && *end != ',' && *end != '}' && *end != ']') return -1;
+    *out = x;
     return 0;
 }
 
@@ -582,53 +915,21 @@ static int json_get_u64(const char *j, const char *k, uint64_t *out) {
     if (json_find_key(j, k, &v) != 0) {
         return -1;
     }
-    *out = strtoull(v, NULL, 10);
+    if (*v == '+' || *v == '-') return -1;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long x = strtoull(v, &end, 10);
+    if (end == v || errno != 0) return -1;
+    end = (char *)skip_ws(end);
+    if (*end && *end != ',' && *end != '}' && *end != ']') return -1;
+    *out = x;
     return 0;
 }
 
 static int json_get_str(const char *j, const char *k, char *out, size_t n) {
     const char *v;
-    if (json_find_key(j, k, &v) != 0 || *v != '"') {
-        return -1;
-    }
-    v++;
-    size_t i = 0;
-    while (*v && *v != '"' && i + 1 < n) {
-        if (*v == '\\' && v[1]) {
-            v++;
-            switch (*v) {
-            case 'n':
-                out[i++] = '\n';
-                break;
-            case 't':
-                out[i++] = '\t';
-                break;
-            case 'r':
-                out[i++] = '\r';
-                break;
-            case 'b':
-                out[i++] = '\b';
-                break;
-            case 'f':
-                out[i++] = '\f';
-                break;
-            case '\\':
-                out[i++] = '\\';
-                break;
-            case '"':
-                out[i++] = '"';
-                break;
-            default:
-                out[i++] = *v;
-                break;
-            }
-            v++;
-            continue;
-        }
-        out[i++] = *v++;
-    }
-    out[i] = '\0';
-    return 0;
+    if (json_find_key(j, k, &v) != 0) return -1;
+    return parse_json_string(skip_ws(v), out, n, NULL);
 }
 
 static int json_get_argv_display(const char *j, char *out, size_t n) {
@@ -636,85 +937,31 @@ static int json_get_argv_display(const char *j, char *out, size_t n) {
     if (json_find_key(j, "argv", &v) != 0 || *v != '[') {
         return -1;
     }
-    v++;
+    v = skip_ws(v + 1);
     size_t off = 0;
     bool first = true;
-    while (*v) {
-        while (*v && isspace((unsigned char)*v)) {
-            v++;
-        }
-        if (*v == ']') {
-            break;
-        }
-        if (*v == ',') {
-            v++;
-            continue;
-        }
-        if (*v != '"') {
+    while (*v && *v != ']') {
+        char arg[SIGMUND_PATH_MAX];
+        if (parse_json_string(v, arg, sizeof(arg), &v) != 0) {
             return -1;
         }
-        v++;
-        char arg[256];
-        size_t ai = 0;
-        while (*v && *v != '"') {
-            if (*v == '\\' && v[1]) {
-                v++;
-                char c = *v;
-                switch (*v) {
-                case 'n':
-                    c = '\n';
-                    break;
-                case 't':
-                    c = '\t';
-                    break;
-                case 'r':
-                    c = '\r';
-                    break;
-                case 'b':
-                    c = '\b';
-                    break;
-                case 'f':
-                    c = '\f';
-                    break;
-                case '\\':
-                    c = '\\';
-                    break;
-                case '"':
-                    c = '"';
-                    break;
-                default:
-                    break;
-                }
-                if (ai + 1 < sizeof(arg)) {
-                    arg[ai++] = c;
-                }
-                v++;
-                continue;
-            }
-            if (ai + 1 < sizeof(arg)) {
-                arg[ai++] = *v;
-            }
-            v++;
-        }
-        if (*v != '"') {
-            return -1;
-        }
-        arg[ai] = '\0';
         if (!first) {
-            if (off + 1 >= n) {
-                break;
-            }
+            if (off + 1 >= n) return -1;
             out[off++] = ' ';
             out[off] = '\0';
         }
         if (append_cmd_escaped(out, n, &off, arg) != 0) {
-            break;
+            return -1;
         }
         first = false;
-        if (*v == '"') {
-            v++;
+        v = skip_ws(v);
+        if (*v == ',') {
+            v = skip_ws(v + 1);
+        } else if (*v != ']') {
+            return -1;
         }
     }
+    if (*v != ']') return -1;
     return 0;
 }
 
@@ -741,19 +988,43 @@ static int load_record(const char *path, struct record *r) {
     fclose(f);
 
     int64_t tmp = 0;
-    json_get_i64(j, "version", &tmp);
+    if (json_get_i64(j, "version", &tmp) != 0) {
+        free(j);
+        return -1;
+    }
     r->version = (int)tmp;
-    json_get_str(j, "id", r->id, sizeof(r->id));
-    json_get_i64(j, "pid", &tmp);
+    if (json_get_str(j, "id", r->id, sizeof(r->id)) != 0) {
+        free(j);
+        return -1;
+    }
+    if (json_get_i64(j, "pid", &tmp) != 0) {
+        free(j);
+        return -1;
+    }
     r->pid = (pid_t)tmp;
-    json_get_i64(j, "pgid", &tmp);
+    if (json_get_i64(j, "pgid", &tmp) != 0) {
+        free(j);
+        return -1;
+    }
     r->pgid = (pid_t)tmp;
-    json_get_i64(j, "sid", &tmp);
+    if (json_get_i64(j, "sid", &tmp) != 0) {
+        free(j);
+        return -1;
+    }
     r->sid = (pid_t)tmp;
-    json_get_i64(j, "start_unix_ns", &r->start_unix_ns);
-    json_get_i64(j, "uid", &tmp);
+    if (json_get_i64(j, "start_unix_ns", &r->start_unix_ns) != 0) {
+        free(j);
+        return -1;
+    }
+    if (json_get_i64(j, "uid", &tmp) != 0) {
+        free(j);
+        return -1;
+    }
     r->uid = (uid_t)tmp;
-    json_get_i64(j, "gid", &tmp);
+    if (json_get_i64(j, "gid", &tmp) != 0) {
+        free(j);
+        return -1;
+    }
     r->gid = (gid_t)tmp;
     if (json_get_str(j, "log_path", r->log_path, sizeof(r->log_path)) == 0) {
         r->has_log = true;
@@ -761,11 +1032,16 @@ static int load_record(const char *path, struct record *r) {
     if (json_get_str(j, "boot_id", r->boot_id, sizeof(r->boot_id)) == 0) {
         r->has_boot = true;
     }
-    json_get_u64(j, "proc_starttime_ticks", &r->proc_starttime_ticks);
-    json_get_u64(j, "exe_dev", &r->exe_dev);
-    json_get_u64(j, "exe_ino", &r->exe_ino);
+    if (json_get_u64(j, "proc_starttime_ticks", &r->proc_starttime_ticks) != 0 ||
+        json_get_u64(j, "exe_dev", &r->exe_dev) != 0 ||
+        json_get_u64(j, "exe_ino", &r->exe_ino) != 0) {
+        free(j);
+        return -1;
+    }
     if (json_get_str(j, "cmdline_display", r->cmdline, sizeof(r->cmdline)) != 0) {
-        json_get_argv_display(j, r->cmdline, sizeof(r->cmdline));
+        if (json_get_argv_display(j, r->cmdline, sizeof(r->cmdline)) != 0) {
+            snprintf(r->cmdline, sizeof(r->cmdline), "?");
+        }
     }
     free(j);
     return 0;
@@ -809,7 +1085,7 @@ static enum run_state eval_state(const struct record *r, const char *current_boo
     return STATE_UNKNOWN;
 }
 
-static int tail_log_until_exit(const struct record *r) {
+static int tail_log_until_exit(const struct record *r, bool from_end) {
     int fd = open(r->log_path, O_RDONLY);
     if (fd < 0) {
         die_errno("sigmund: failed to open log for tail");
@@ -818,6 +1094,9 @@ static int tail_log_until_exit(const struct record *r) {
     char boot[128] = {0};
     if (r->has_boot) {
         get_boot_id(boot, sizeof(boot));
+    }
+    if (from_end) {
+        lseek(fd, 0, SEEK_END);
     }
 
     struct sigaction sa = {0}, old_sa = {0};
@@ -862,17 +1141,18 @@ static int tail_log_until_exit(const struct record *r) {
     return 0;
 }
 
-static int perform_start(const char *dir, bool persistent, bool tail, int argc, char **argv) {
+static int perform_start(const char *dir, bool tail, int argc, char **argv) {
 
-    char id[16], log_path[1200], boot_id[128] = {0};
-    if (persistent && get_boot_id(boot_id, sizeof(boot_id)) != 0) {
-        persistent = false;
-    }
+    char id[16], log_path[SIGMUND_PATH_MAX], reserve_path[SIGMUND_PATH_MAX], boot_id[128] = {0};
+    bool has_boot = get_boot_id(boot_id, sizeof(boot_id)) == 0;
     if (gen_id(dir, id, sizeof(id)) != 0) {
         die_errno("sigmund: failed to generate id");
     }
     if (checked_snprintf(log_path, sizeof(log_path), "%s/%s.log", dir, id) != 0) {
         die_errno("sigmund: log path too long");
+    }
+    if (checked_snprintf(reserve_path, sizeof(reserve_path), "%s/.%s.reserve", dir, id) != 0) {
+        die_errno("sigmund: reserve path too long");
     }
 
     int pipefd[2];
@@ -930,12 +1210,15 @@ static int perform_start(const char *dir, bool persistent, bool tail, int argc, 
         int st;
         waitpid(pid, &st, 0);
         fprintf(stderr, "sigmund: exec failed: %s\n", strerror(child_errno));
+        unlink(reserve_path);
         return 1;
     }
 
     struct record r = {0};
     r.version = 1;
-    snprintf(r.id, sizeof(r.id), "%s", id);
+    if (checked_snprintf(r.id, sizeof(r.id), "%s", id) != 0) {
+        die_errno("sigmund: id too long");
+    }
     r.pid = pid;
     r.pgid = pid;
     r.sid = pid;
@@ -945,9 +1228,10 @@ static int perform_start(const char *dir, bool persistent, bool tail, int argc, 
     r.uid = getuid();
     r.gid = getgid();
     r.has_log = true;
-    strncpy(r.log_path, log_path, sizeof(r.log_path) - 1);
-    r.log_path[sizeof(r.log_path) - 1] = 0;
-    r.has_boot = persistent;
+    if (checked_snprintf(r.log_path, sizeof(r.log_path), "%s", log_path) != 0) {
+        die_errno("sigmund: log path too long");
+    }
+    r.has_boot = has_boot;
     if (r.has_boot) {
         snprintf(r.boot_id, sizeof(r.boot_id), "%s", boot_id);
     }
@@ -968,6 +1252,7 @@ static int perform_start(const char *dir, bool persistent, bool tail, int argc, 
         }
     }
     if (write_record_atomic(dir, &r, argc, argv, NULL, 0) != 0) {
+        unlink(reserve_path);
         die_errno("sigmund: failed to write record");
     }
 
@@ -977,7 +1262,7 @@ static int perform_start(const char *dir, bool persistent, bool tail, int argc, 
     fflush(stdout);
 
     if (tail) {
-        return tail_log_until_exit(&r);
+        return tail_log_until_exit(&r, false);
     }
     return 0;
 }
@@ -989,15 +1274,15 @@ static int load_record_by_id(const char *dir, const char *id, struct record *r, 
     if (checked_snprintf(path, n, "%s/%s.json", dir, id) != 0) {
         return -1;
     }
-    if (access(path, F_OK) != 0) {
+    if (load_record(path, r) != 0) {
         return -1;
     }
-    return load_record(path, r);
+    return 0;
 }
 
 static int do_signal_action(const char *dir, const char *id, int sig, bool graceful) {
     struct record r;
-    char path[1200], boot[128] = {0};
+    char path[SIGMUND_PATH_MAX], boot[128] = {0};
     if (load_record_by_id(dir, id, &r, path, sizeof(path)) != 0) {
         return 5;
     }
@@ -1105,7 +1390,7 @@ static int cmd_list(const char *dir) {
         if (!has_suffix(e->d_name, ".json")) {
             continue;
         }
-        char path[1200];
+        char path[SIGMUND_PATH_MAX];
         if (checked_snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) != 0) {
             continue;
         }
@@ -1121,8 +1406,9 @@ static int cmd_list(const char *dir) {
         char age[32];
         format_age(r.start_unix_ns, age, sizeof(age));
         char cmd[64];
-        strncpy(cmd, r.cmdline[0] ? r.cmdline : "?", sizeof(cmd) - 1);
-        cmd[sizeof(cmd) - 1] = 0;
+        if (checked_snprintf(cmd, sizeof(cmd), "%s", r.cmdline[0] ? r.cmdline : "?") != 0) {
+            continue;
+        }
         if (strlen(cmd) > 48) {
             cmd[48] = '\0';
             strcat(cmd, "...");
@@ -1145,12 +1431,13 @@ static int cmd_prune(const char *dir) {
         if (!has_suffix(e->d_name, ".json")) {
             continue;
         }
-        char path[1200];
+        char path[SIGMUND_PATH_MAX];
         if (checked_snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) != 0) {
             continue;
         }
         struct record r;
         if (load_record(path, &r) != 0) {
+            unlink(path);
             continue;
         }
         if (!valid_record(&r)) {
@@ -1183,7 +1470,7 @@ static int cmd_prune(const char *dir) {
         if (!valid_id(id)) {
             continue;
         }
-        char json_path[1200], log_path[1200];
+        char json_path[SIGMUND_PATH_MAX], log_path[SIGMUND_PATH_MAX];
         if (checked_snprintf(json_path, sizeof(json_path), "%s/%s.json", dir, id) != 0) {
             continue;
         }
@@ -1203,7 +1490,7 @@ static void usage(void) {
            "usage:\n"
            "  sigmund <cmd...>              launch command in background\n"
            "  sigmund --tail <cmd...>       launch and follow log output\n"
-           "  sigmund --tail <id>           follow log of running process\n"
+           "  sigmund tail <id>             follow existing log output\n"
            "  sigmund -l, --list            list tracked processes\n"
            "  sigmund stop <id>...          graceful stop (SIGTERM → SIGKILL)\n"
            "  sigmund kill <id>...          immediate kill (SIGKILL)\n"
@@ -1218,55 +1505,69 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    char dir[1024];
-    bool persistent = false;
-    if (ensure_storage(dir, sizeof(dir), &persistent) != 0) {
+    char dir[SIGMUND_PATH_MAX];
+    if (ensure_storage(dir, sizeof(dir)) != 0) {
         die_errno("sigmund: failed to init storage");
     }
+    if (maybe_cleanup_for_boot(dir) != 0) {
+        die_errno("sigmund: failed to perform boot cleanup");
+    }
 
-    bool tail = false;
-    if (!strcmp(argv[1], "--tail")) {
-        if (argc < 3) {
+    int argi = 1;
+    if (!strcmp(argv[argi], "--tail")) {
+        argi++;
+        if (argi >= argc) {
             usage();
             return 5;
         }
-        tail = true;
-        argc--;
-        argv++;
-    }
-
-    if (!strcmp(argv[1], "--")) {
-        if (argc < 3) {
-            return 5;
-        }
-        return perform_start(dir, persistent, tail, argc - 2, argv + 2);
-    }
-
-    if (tail && argc == 2) {
-        struct record r;
-        char path[1200];
-        if (valid_id(argv[1]) && load_record_by_id(dir, argv[1], &r, path, sizeof(path)) == 0) {
-            if (!r.has_log) {
-                fprintf(stderr, "sigmund: record has no log path: %s\n", argv[1]);
+        if (!strcmp(argv[argi], "--")) {
+            argi++;
+            if (argi >= argc) {
+                usage();
                 return 5;
             }
-            return tail_log_until_exit(&r);
         }
+        return perform_start(dir, true, argc - argi, argv + argi);
     }
 
-    if (!strcmp(argv[1], "-l") || !strcmp(argv[1], "--list")) {
+    if (!strcmp(argv[argi], "--")) {
+        argi++;
+        if (argi >= argc) {
+            return 5;
+        }
+        return perform_start(dir, false, argc - argi, argv + argi);
+    }
+
+    if (!strcmp(argv[argi], "tail")) {
+        if (argi + 1 >= argc) {
+            fprintf(stderr, "usage: sigmund tail <id>\n");
+            return 5;
+        }
+        struct record r;
+        char path[SIGMUND_PATH_MAX];
+        if (load_record_by_id(dir, argv[argi + 1], &r, path, sizeof(path)) != 0) {
+            return 5;
+        }
+        if (!r.has_log) {
+            fprintf(stderr, "sigmund: record has no log path: %s\n", argv[argi + 1]);
+            return 5;
+        }
+        return tail_log_until_exit(&r, true);
+    }
+
+    if (!strcmp(argv[argi], "-l") || !strcmp(argv[argi], "--list")) {
         return cmd_list(dir);
     }
-    if (!strcmp(argv[1], "prune")) {
+    if (!strcmp(argv[argi], "prune")) {
         return cmd_prune(dir);
     }
-    if (!strcmp(argv[1], "stop")) {
-        if (argc < 3) {
+    if (!strcmp(argv[argi], "stop")) {
+        if (argi + 1 >= argc) {
             fprintf(stderr, "usage: sigmund stop <id>...\n");
             return 5;
         }
         int worst = 0;
-        for (int i = 2; i < argc; i++) {
+        for (int i = argi + 1; i < argc; i++) {
             int rc = do_signal_action(dir, argv[i], SIGTERM, true);
             if (rc > worst) {
                 worst = rc;
@@ -1274,13 +1575,13 @@ int main(int argc, char **argv) {
         }
         return worst;
     }
-    if (!strcmp(argv[1], "kill")) {
-        if (argc < 3) {
+    if (!strcmp(argv[argi], "kill")) {
+        if (argi + 1 >= argc) {
             fprintf(stderr, "usage: sigmund kill <id>...\n");
             return 5;
         }
         int worst = 0;
-        for (int i = 2; i < argc; i++) {
+        for (int i = argi + 1; i < argc; i++) {
             int rc = do_signal_action(dir, argv[i], SIGKILL, false);
             if (rc > worst) {
                 worst = rc;
@@ -1288,15 +1589,15 @@ int main(int argc, char **argv) {
         }
         return worst;
     }
-    if (!strcmp(argv[1], "killcmd")) {
-        if (argc < 3) {
+    if (!strcmp(argv[argi], "killcmd")) {
+        if (argi + 1 >= argc) {
             fprintf(stderr, "usage: sigmund killcmd <id>...\n");
             return 5;
         }
         int worst = 0;
-        for (int i = 2; i < argc; i++) {
+        for (int i = argi + 1; i < argc; i++) {
             struct record r;
-            char path[1200];
+            char path[SIGMUND_PATH_MAX];
             int rc = 0;
             if (load_record_by_id(dir, argv[i], &r, path, sizeof(path)) != 0) {
                 rc = 5;
@@ -1312,14 +1613,14 @@ int main(int argc, char **argv) {
         }
         return worst;
     }
-    if (!strcmp(argv[1], "--version")) {
+    if (!strcmp(argv[argi], "--version")) {
         puts(SIGMUND_VERSION);
         return 0;
     }
-    if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h")) {
+    if (!strcmp(argv[argi], "--help") || !strcmp(argv[argi], "-h")) {
         usage();
         return 0;
     }
 
-    return perform_start(dir, persistent, tail, argc - 1, argv + 1);
+    return perform_start(dir, false, argc - argi, argv + argi);
 }

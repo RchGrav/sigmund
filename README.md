@@ -108,7 +108,7 @@ sigmund -l
 
 Use `sigmund --tail <cmd> [args...]` to launch exactly the same way and then follow the log in your terminal.
 
-Use `sigmund --tail <id>` to follow the log of an already-running tracked process.
+Use `sigmund tail <id>` to follow the log of an already-running tracked process.
 
 Press Ctrl-C to detach from tailing while the background process keeps running.
 

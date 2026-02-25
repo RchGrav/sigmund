@@ -43,11 +43,11 @@ sigmund: stop: sigmund stop 7f3c2a
 ### Tail
 
     sigmund --tail <cmd> [args...]
-    sigmund --tail <id>
+    sigmund tail <id>
 
 `sigmund --tail <cmd> [args...]` launches the command identically to `sigmund <cmd>` (backgrounded, log file, new session), then tails the log file to stdout.
 
-`sigmund --tail <id>` tails the log for an already-running tracked process.
+`sigmund tail <id>` tails the log for an already-running tracked process.
 
 Ctrl-C detaches from tailing — the background process keeps running.
 
