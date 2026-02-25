@@ -74,11 +74,11 @@ test_lifecycle() {
   printf '%s\n' "$out" | grep -Eq 'pid=[0-9]+ pgid=[0-9]+ sid=[0-9]+'
   printf '%s\n' "$out" | grep -Eq '^sigmund: log: .+/.+\\.log$'
   printf '%s\n' "$out" | grep -Eq "^sigmund: stop: sigmund stop $id$"
-  "$SIGMUND_BIN" -l | grep -Eq "^$id[[:space:]].*running"
+  "$SIGMUND_BIN" list | grep -Eq "^$id[[:space:]].*running"
   "$SIGMUND_BIN" stop "$id" >/dev/null
-  "$SIGMUND_BIN" -l | grep -Eq "^$id[[:space:]].*dead"
+  "$SIGMUND_BIN" list | grep -Eq "^$id[[:space:]].*dead"
   "$SIGMUND_BIN" prune >/dev/null
-  lines=$("$SIGMUND_BIN" -l | wc -l)
+  lines=$("$SIGMUND_BIN" list | wc -l)
   [ "$lines" -eq 1 ]
 }
 
@@ -135,13 +135,13 @@ test_fast_exit_record_dead() {
   id=$(printf '%s\n' "$out" | extract_id)
   [ -n "$id" ] || return 1
   sleep 0.1
-  "$SIGMUND_BIN" -l | grep -Eq "^$id[[:space:]].*dead"
+  "$SIGMUND_BIN" list | grep -Eq "^$id[[:space:]].*dead"
 }
 
 test_corrupt_record_handling() {
   mkdir -p "$HOME/.local/state/sigmund" || return 1
   printf 'garbage\n' > "$HOME/.local/state/sigmund/badbad.json" || return 1
-  "$SIGMUND_BIN" -l >"$TEST_ROOT/list.out" 2>"$TEST_ROOT/list.err" || return 1
+  "$SIGMUND_BIN" list >"$TEST_ROOT/list.out" 2>"$TEST_ROOT/list.err" || return 1
   ! grep -q '^badbad' "$TEST_ROOT/list.out"
   ! grep -Eq '^0[[:space:]]' "$TEST_ROOT/list.out"
   grep -q 'warning: skipping corrupt record badbad.json' "$TEST_ROOT/list.err"
@@ -154,7 +154,7 @@ test_invalid_pgid_record() {
   cat > "$HOME/.local/state/sigmund/abc123.json" <<'JSON'
 {"version":1,"id":"abc123","pid":12345,"pgid":0,"sid":12345,"start_unix_ns":0,"argv":["x"],"cmdline_display":"x","uid":0,"gid":0,"proc_starttime_ticks":0,"exe_dev":0,"exe_ino":0}
 JSON
-  "$SIGMUND_BIN" -l >"$TEST_ROOT/list.out" 2>"$TEST_ROOT/list.err" || return 1
+  "$SIGMUND_BIN" list >"$TEST_ROOT/list.out" 2>"$TEST_ROOT/list.err" || return 1
   ! grep -q '^abc123' "$TEST_ROOT/list.out"
 }
 
