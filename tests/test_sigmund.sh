@@ -249,7 +249,7 @@ test_log_capture() {
 
 test_tail_verb_existing_id() {
   local out id tailed
-  out=$("$SIGMUND_BIN" bash -c 'sleep 0.1; echo from_tail_id; sleep 0.1' 2>&1) || return 1
+  out=$("$SIGMUND_BIN" bash -c 'sleep 0.3; echo from_tail_id; sleep 0.1' 2>&1) || return 1
   id=$(printf '%s\n' "$out" | extract_id)
   [ -n "$id" ] || return 1
   tailed=$("$SIGMUND_BIN" tail "$id" 2>&1) || return 1
