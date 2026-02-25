@@ -9,14 +9,13 @@ fail() { echo "FAIL: $1"; FAILS=$((FAILS + 1)); }
 
 new_env() {
   TEST_ROOT="$(mktemp -d)" || return 1
-  export XDG_RUNTIME_DIR="$TEST_ROOT/runtime"
-  mkdir -p "$XDG_RUNTIME_DIR" || return 1
-  chmod 700 "$XDG_RUNTIME_DIR" || return 1
+  export HOME="$TEST_ROOT/home"
+  mkdir -p "$HOME" || return 1
 }
 
 cleanup_env() {
   local store ids id
-  store="$XDG_RUNTIME_DIR/sigmund"
+  store="$HOME/.local/state/sigmund"
   if [ -d "$store" ]; then
     ids=$(find "$store" -maxdepth 1 -type f -name '*.json' -printf '%f\n' 2>/dev/null | sed 's/\.json$//' || true)
     for id in $ids; do
@@ -126,7 +125,7 @@ test_exec_failure_no_record() {
   rc=$?
   set -e
   [ "$rc" -eq 1 ] || return 1
-  count=$(find "$XDG_RUNTIME_DIR/sigmund" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l)
+  count=$(find "$HOME/.local/state/sigmund" -maxdepth 1 -type f -name '*.json' 2>/dev/null | wc -l)
   [ "$count" -eq 0 ]
 }
 
@@ -140,19 +139,19 @@ test_fast_exit_record_dead() {
 }
 
 test_corrupt_record_handling() {
-  mkdir -p "$XDG_RUNTIME_DIR/sigmund" || return 1
-  printf 'garbage\n' > "$XDG_RUNTIME_DIR/sigmund/badbad.json" || return 1
+  mkdir -p "$HOME/.local/state/sigmund" || return 1
+  printf 'garbage\n' > "$HOME/.local/state/sigmund/badbad.json" || return 1
   "$SIGMUND_BIN" -l >"$TEST_ROOT/list.out" 2>"$TEST_ROOT/list.err" || return 1
   ! grep -q '^badbad' "$TEST_ROOT/list.out"
   ! grep -Eq '^0[[:space:]]' "$TEST_ROOT/list.out"
   grep -q 'warning: skipping corrupt record badbad.json' "$TEST_ROOT/list.err"
   "$SIGMUND_BIN" prune >/dev/null || return 1
-  [ ! -e "$XDG_RUNTIME_DIR/sigmund/badbad.json" ]
+  [ ! -e "$HOME/.local/state/sigmund/badbad.json" ]
 }
 
 test_invalid_pgid_record() {
-  mkdir -p "$XDG_RUNTIME_DIR/sigmund" || return 1
-  cat > "$XDG_RUNTIME_DIR/sigmund/abc123.json" <<'JSON'
+  mkdir -p "$HOME/.local/state/sigmund" || return 1
+  cat > "$HOME/.local/state/sigmund/abc123.json" <<'JSON'
 {"version":1,"id":"abc123","pid":12345,"pgid":0,"sid":12345,"start_unix_ns":0,"argv":["x"],"cmdline_display":"x","uid":0,"gid":0,"proc_starttime_ticks":0,"exe_dev":0,"exe_ino":0}
 JSON
   "$SIGMUND_BIN" -l >"$TEST_ROOT/list.out" 2>"$TEST_ROOT/list.err" || return 1
@@ -160,11 +159,11 @@ JSON
 }
 
 test_orphan_log_cleanup() {
-  mkdir -p "$XDG_RUNTIME_DIR/sigmund" || return 1
-  : > "$XDG_RUNTIME_DIR/sigmund/a1b2c3.log" || return 1
-  : > "$XDG_RUNTIME_DIR/sigmund/deadbe.log" || return 1
+  mkdir -p "$HOME/.local/state/sigmund" || return 1
+  : > "$HOME/.local/state/sigmund/a1b2c3.log" || return 1
+  : > "$HOME/.local/state/sigmund/deadbe.log" || return 1
   "$SIGMUND_BIN" prune >/dev/null || return 1
-  [ ! -e "$XDG_RUNTIME_DIR/sigmund/a1b2c3.log" ] && [ ! -e "$XDG_RUNTIME_DIR/sigmund/deadbe.log" ]
+  [ ! -e "$HOME/.local/state/sigmund/a1b2c3.log" ] && [ ! -e "$HOME/.local/state/sigmund/deadbe.log" ]
 }
 
 test_id_sanitization() {
@@ -229,7 +228,7 @@ test_special_chars_args() {
   out=$("$SIGMUND_BIN" echo "hello world" "it's" 2>&1) || return 1
   id=$(printf '%s\n' "$out" | extract_id)
   [ -n "$id" ] || return 1
-  json="$XDG_RUNTIME_DIR/sigmund/$id.json"
+  json="$HOME/.local/state/sigmund/$id.json"
   [ -f "$json" ] || return 1
   grep -Fq '"hello world"' "$json"
   grep -Fq '"it'"'"'s"' "$json"
@@ -240,7 +239,7 @@ test_log_capture() {
   out=$("$SIGMUND_BIN" bash -c 'echo out; echo err >&2; sleep 0.1' 2>&1) || return 1
   id=$(printf '%s\n' "$out" | extract_id)
   [ -n "$id" ] || return 1
-  log="$XDG_RUNTIME_DIR/sigmund/$id.log"
+  log="$HOME/.local/state/sigmund/$id.log"
   sleep 0.4
   [ -f "$log" ] || return 1
   grep -q 'out' "$log" && grep -q 'err' "$log"
@@ -248,14 +247,15 @@ test_log_capture() {
 
 
 
-test_tail_existing_id() {
+test_tail_verb_existing_id() {
   local out id tailed
-  out=$("$SIGMUND_BIN" bash -c 'echo from_tail_id; sleep 0.2' 2>&1) || return 1
+  out=$("$SIGMUND_BIN" bash -c 'sleep 0.1; echo from_tail_id; sleep 0.1' 2>&1) || return 1
   id=$(printf '%s\n' "$out" | extract_id)
   [ -n "$id" ] || return 1
-  tailed=$("$SIGMUND_BIN" --tail "$id" 2>&1) || return 1
+  tailed=$("$SIGMUND_BIN" tail "$id" 2>&1) || return 1
   printf '%s\n' "$tailed" | grep -q 'from_tail_id'
 }
+
 test_concurrent_unique_ids() {
   local i id ids uniq
   ids=""
@@ -288,7 +288,7 @@ run_test "stop supports multiple IDs in one command" test_stop_multiple_ids
 run_test "argument edge cases" test_argument_edges
 run_test "special characters are preserved in argv JSON" test_special_chars_args
 run_test "logging captures stdout+stderr" test_log_capture
-run_test "--tail <id> tails an existing run log" test_tail_existing_id
+run_test "tail <id> tails an existing run log" test_tail_verb_existing_id
 run_test "concurrent starts produce unique ids" test_concurrent_unique_ids
 
 if [ "$FAILS" -ne 0 ]; then
