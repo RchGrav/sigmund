@@ -1487,15 +1487,24 @@ static int cmd_prune(const char *dir) {
 
 static void usage(void) {
     printf("sigmund %s — More than nohup, less than systemd.\n\n"
-           "usage:\n"
+           "start forms:\n"
            "  sigmund <cmd...>              launch command in background\n"
-           "  sigmund --tail <cmd...>       launch and follow log output\n"
+           "  sigmund --tail <cmd...>       launch command and stream log output\n"
+           "\n"
+           "commands:\n"
+           "  sigmund list                  list tracked processes\n"
            "  sigmund tail <id>             follow existing log output\n"
-           "  sigmund -l, --list            list tracked processes\n"
            "  sigmund stop <id>...          graceful stop (SIGTERM → SIGKILL)\n"
            "  sigmund kill <id>...          immediate kill (SIGKILL)\n"
            "  sigmund killcmd <id>...       print kill command for scripting\n"
-           "  sigmund prune                 remove dead records and logs\n",
+           "  sigmund prune                 remove dead records and logs\n"
+           "\n"
+           "switches:\n"
+           "  --tail                        start-mode switch (use with <cmd...>)\n"
+           "\n"
+           "note:\n"
+           "  Use 'sigmund -- <cmd...>' to run a command whose name overlaps\n"
+           "  with a sigmund command (for example: sigmund -- list).\n",
            SIGMUND_VERSION);
 }
 
@@ -1555,7 +1564,7 @@ int main(int argc, char **argv) {
         return tail_log_until_exit(&r, true);
     }
 
-    if (!strcmp(argv[argi], "-l") || !strcmp(argv[argi], "--list")) {
+    if (!strcmp(argv[argi], "list")) {
         return cmd_list(dir);
     }
     if (!strcmp(argv[argi], "prune")) {

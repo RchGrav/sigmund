@@ -46,7 +46,7 @@ sigmund: log: /run/user/1000/sigmund/7f3c2a.log
 sigmund: stop: sigmund stop 7f3c2a
 
 # List tracked runs
-$ sigmund -l
+$ sigmund list
 ID      PID      PGID     AGE    STATE    CMD
 7f3c2a  4012     4012     12s    running  qemu-system-x86_64 -m 4096...
 
@@ -78,7 +78,7 @@ When running integration tests, you often need to spin up a server, run tests ag
   if: always()
   run: |
     # Find and stop the redis server
-    RUN_ID=$(sigmund -l | grep redis-server | awk '{print $1}')
+    RUN_ID=$(sigmund list | grep redis-server | awk '{print $1}')
     sigmund stop $RUN_ID
     sigmund prune
 ```
@@ -92,7 +92,7 @@ sigmund npm run dev:backend
 sigmund celery -A myapp worker
 
 # Later, when you want to stop working:
-sigmund -l
+sigmund list
 # Stop them individually, or script a teardown of all running jobs
 ```
 
@@ -100,14 +100,32 @@ sigmund -l
 
 ## Command Reference
 
+### Start commands
+
+| Command                        | Description                                           |
+|--------------------------------|-------------------------------------------------------|
+| `sigmund <cmd...>`             | Starts a command in a new process group.              |
+| `sigmund --tail <cmd...>`      | Starts a command and immediately follows its log.     |
+| `sigmund -- <cmd...>`          | Starts a command whose name overlaps with a subcommand. |
+
+### Management commands
+
 | Command                | Description                                                                                    |
 |------------------------|------------------------------------------------------------------------------------------------|
-| `sigmund <cmd>`        | Starts a command in a new process group.                                                       |
-| `sigmund -l`, `--list` | Lists all tracked runs, their PIDs, age, state, and command.                                   |                        
-| `sigmund stop <id>`    | Gracefully stops a run. Sends `SIGTERM` to the group, waits up to 5s, then sends `SIGKILL`.    |
+| `sigmund list`         | Lists all tracked runs, their PIDs, age, state, and command.                                  |
+| `sigmund tail <id>`    | Follows the log for an already-running tracked process.                                        |
+| `sigmund stop <id>`    | Gracefully stops a run. Sends `SIGTERM` to the group, waits up to 5s, then sends `SIGKILL`.  |
 | `sigmund kill <id>`    | Forcefully kills a run immediately using `SIGKILL`.                                            |
-| `sigmund prune`        | Cleans up the state files and logs for processes that are natively `dead`.                     |
 | `sigmund killcmd <id>` | Prints the raw shell command needed to signal the process group (e.g., `kill -TERM -- -4012`). |
+| `sigmund prune`        | Cleans up the state files and logs for processes that are natively `dead`.                    |
+
+### Switches
+
+| Switch        | Description                               |
+|---------------|-------------------------------------------|
+| `--tail`      | Launches a command and immediately streams its log output. |
+
+> **Note:** `--` is an argument separator, not a switch. Use it when your command name could be interpreted as a `sigmund` command. Example: `sigmund -- list`.
 
 ## Stdio & Logging
 
