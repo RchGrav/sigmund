@@ -23,7 +23,9 @@
 #define ID_HEX_LEN 6
 #define STOP_TIMEOUT_MS 5000
 #define POLL_SLEEP_MS 25
-#define SIGMUND_VERSION "0.1.0"
+#ifndef SIGMUND_VERSION
+#define SIGMUND_VERSION "dev"
+#endif
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
