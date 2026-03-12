@@ -142,12 +142,15 @@ Start output always includes the log path and a stop command:
 
 ### Storage directory
 
-Preferred (volatile, per-login):
+Persistent per-user storage:
 
-1. If `$XDG_RUNTIME_DIR` is set: `$XDG_RUNTIME_DIR/sigmund/`
+1. `$XDG_STATE_HOME/sigmund/` when explicitly supported by the implementation
+2. otherwise `~/.local/state/sigmund/`
 
-Fallback (persistent):
-2. `$XDG_STATE_HOME/sigmund/` else `~/.local/state/sigmund/`
+Current implementation note:
+
+* The current Linux implementation intentionally uses `~/.local/state/sigmund/` directly rather than preferring `$XDG_RUNTIME_DIR`.
+* This is a design choice to keep state and logs stable across shells, CI runners, WSL environments, and hosts where XDG runtime handling is unavailable or inconsistent.
 
 Permissions:
 
@@ -156,7 +159,7 @@ Permissions:
 
 ### Boot correlation (Linux)
 
-If the fallback persistent directory is used, records must include Linux `boot_id` from:
+Because the implementation uses persistent storage, records must include Linux `boot_id` from:
 
 * `/proc/sys/kernel/random/boot_id`
 

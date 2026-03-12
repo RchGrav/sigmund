@@ -143,7 +143,7 @@ Press Ctrl-C to detach from tailing while the background process keeps running.
 
 ## Architecture & Safety Guarantees
 
-`sigmund` tracks state in `~/.local/state/sigmund`. All state updates use atomic file renames (`rename()` + `fsync()`) so records are never corrupted, even during power loss.
+`sigmund` tracks state in `~/.local/state/sigmund`. This is intentionally a persistent per-user location rather than `$XDG_RUNTIME_DIR`, because persistent state/logs are more predictable across shells, CI environments, WSL setups, and hosts where XDG runtime handling is inconsistent. All state updates use atomic file renames (`rename()` + `fsync()`) so records are never corrupted, even during power loss.
 
 **Strict Identity Validation:**
 Before sending *any* signal, `sigmund` checks:
