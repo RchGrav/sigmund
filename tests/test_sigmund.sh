@@ -11,6 +11,8 @@ new_env() {
   TEST_ROOT="$(mktemp -d)" || return 1
   export HOME="$TEST_ROOT/home"
   mkdir -p "$HOME" || return 1
+  TEST_BOOT_ID="/tmp/sigmund_test_boot_id"
+  printf 'boot-a\n' > "$TEST_BOOT_ID" || return 1
 }
 
 cleanup_env() {
@@ -76,8 +78,8 @@ test_lifecycle() {
   printf '%s\n' "$out" | grep -Eq "^sigmund: stop: sigmund stop $id$"
   "$SIGMUND_BIN" list | grep -Eq "^$id[[:space:]].*running"
   "$SIGMUND_BIN" stop "$id" >/dev/null
-  "$SIGMUND_BIN" list | grep -Eq "^$id[[:space:]].*dead"
-  "$SIGMUND_BIN" prune >/dev/null
+  "$SIGMUND_BIN" list | grep -Eq "^$id[[:space:]].*exited"
+  "$SIGMUND_BIN" prune all >/dev/null
   lines=$("$SIGMUND_BIN" list | wc -l)
   [ "$lines" -eq 1 ]
 }
@@ -129,13 +131,13 @@ test_exec_failure_no_record() {
   [ "$count" -eq 0 ]
 }
 
-test_fast_exit_record_dead() {
+test_fast_exit_record_exited() {
   local out id
   out=$("$SIGMUND_BIN" true 2>&1) || return 1
   id=$(printf '%s\n' "$out" | extract_id)
   [ -n "$id" ] || return 1
   sleep 0.1
-  "$SIGMUND_BIN" list | grep -Eq "^$id[[:space:]].*dead"
+  "$SIGMUND_BIN" list | grep -Eq "^$id[[:space:]].*exited"
 }
 
 test_corrupt_record_handling() {
@@ -145,7 +147,7 @@ test_corrupt_record_handling() {
   ! grep -q '^badbad' "$TEST_ROOT/list.out"
   ! grep -Eq '^0[[:space:]]' "$TEST_ROOT/list.out"
   grep -q 'warning: skipping corrupt record badbad.json' "$TEST_ROOT/list.err"
-  "$SIGMUND_BIN" prune >/dev/null || return 1
+  "$SIGMUND_BIN" prune all >/dev/null || return 1
   [ ! -e "$HOME/.local/state/sigmund/badbad.json" ]
 }
 
@@ -156,14 +158,6 @@ test_invalid_pgid_record() {
 JSON
   "$SIGMUND_BIN" list >"$TEST_ROOT/list.out" 2>"$TEST_ROOT/list.err" || return 1
   ! grep -q '^abc123' "$TEST_ROOT/list.out"
-}
-
-test_orphan_log_cleanup() {
-  mkdir -p "$HOME/.local/state/sigmund" || return 1
-  : > "$HOME/.local/state/sigmund/a1b2c3.log" || return 1
-  : > "$HOME/.local/state/sigmund/deadbe.log" || return 1
-  "$SIGMUND_BIN" prune >/dev/null || return 1
-  [ ! -e "$HOME/.local/state/sigmund/a1b2c3.log" ] && [ ! -e "$HOME/.local/state/sigmund/deadbe.log" ]
 }
 
 test_id_sanitization() {
@@ -282,16 +276,105 @@ test_concurrent_unique_ids() {
   [ "$uniq" -eq 20 ]
 }
 
+test_list_columns() {
+  local out id
+  out=$("$SIGMUND_BIN" sleep 300 2>&1) || return 1
+  id=$(printf '%s\n' "$out" | extract_id)
+  [ -n "$id" ] || return 1
+  "$SIGMUND_BIN" list >"$TEST_ROOT/list.out" || return 1
+  grep -Eq '^RUNID[[:space:]]+STATE[[:space:]]+STARTED_AT[[:space:]]+RESULT[[:space:]]+CMD$' "$TEST_ROOT/list.out"
+  grep -Eq "^$id[[:space:]]+running[[:space:]]+[0-9]{4}-[0-9]{2}-[0-9]{2}T.*Z[[:space:]]+-[[:space:]]+" "$TEST_ROOT/list.out"
+}
+
+test_persistent_stale_records() {
+  local out id log store rc
+  out=$("$SIGMUND_BIN" bash -c 'echo stale-line; sleep 0.1' 2>&1) || return 1
+  id=$(printf '%s\n' "$out" | extract_id)
+  [ -n "$id" ] || return 1
+  sleep 0.3
+  store="$HOME/.local/state/sigmund"
+  log="$store/$id.log"
+  [ -f "$store/$id.json" ] && [ -f "$log" ] || return 1
+  printf 'boot-b\n' > /tmp/sigmund_test_boot_id || return 1
+  "$SIGMUND_BIN" list >"$TEST_ROOT/list.out" || return 1
+  grep -Eq "^$id[[:space:]]+stale" "$TEST_ROOT/list.out" || return 1
+  set +e
+  "$SIGMUND_BIN" stop "$id" >/dev/null 2>"$TEST_ROOT/stop.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 2 ] || return 1
+  grep -q 'stale (prior boot)' "$TEST_ROOT/stop.err" || return 1
+  set +e
+  "$SIGMUND_BIN" kill "$id" >/dev/null 2>"$TEST_ROOT/kill.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 2 ] || return 1
+  grep -q 'stale (prior boot)' "$TEST_ROOT/kill.err" || return 1
+  set +e
+  "$SIGMUND_BIN" killcmd "$id" >/dev/null 2>"$TEST_ROOT/killcmd.err"
+  rc=$?
+  set -e
+  [ "$rc" -eq 2 ] || return 1
+  grep -q 'stale (prior boot)' "$TEST_ROOT/killcmd.err" || return 1
+  "$SIGMUND_BIN" tail "$id" >"$TEST_ROOT/tail.out" || return 1
+  "$SIGMUND_BIN" dump "$id" >"$TEST_ROOT/dump.out" || return 1
+  grep -q 'stale-line' "$TEST_ROOT/dump.out"
+}
+
+test_prune_by_id() {
+  local out1 out2 id1 id2 store
+  out1=$("$SIGMUND_BIN" true 2>&1) || return 1
+  out2=$("$SIGMUND_BIN" true 2>&1) || return 1
+  id1=$(printf '%s\n' "$out1" | extract_id)
+  id2=$(printf '%s\n' "$out2" | extract_id)
+  store="$HOME/.local/state/sigmund"
+  [ -f "$store/$id1.json" ] && [ -f "$store/$id2.json" ] || return 1
+  "$SIGMUND_BIN" prune "$id1" >/dev/null || return 1
+  [ ! -e "$store/$id1.json" ] && [ ! -e "$store/$id1.log" ] || return 1
+  [ -e "$store/$id2.json" ] && [ -e "$store/$id2.log" ]
+}
+
+test_prune_all_preserves_running() {
+  local outr outx idr idx store
+  outr=$("$SIGMUND_BIN" sleep 300 2>&1) || return 1
+  outx=$("$SIGMUND_BIN" true 2>&1) || return 1
+  idr=$(printf '%s\n' "$outr" | extract_id)
+  idx=$(printf '%s\n' "$outx" | extract_id)
+  store="$HOME/.local/state/sigmund"
+  "$SIGMUND_BIN" prune all >/dev/null || return 1
+  [ -e "$store/$idr.json" ] || return 1
+  [ ! -e "$store/$idx.json" ]
+}
+
+test_transactional_record_write_failure() {
+  local rc id out
+  set +e
+  out=$(SIGMUND_TEST_FAIL_RECORD_WRITE=1 "$SIGMUND_BIN" sleep 300 2>&1)
+  rc=$?
+  set -e
+  [ "$rc" -eq 1 ] || return 1
+  id=$(printf '%s\n' "$out" | extract_id)
+  [ -z "$id" ] || return 1
+  ! pgrep -f 'sleep 300' >/dev/null 2>&1
+}
+
+test_build_artifacts_coexist() {
+  make clean >/dev/null || return 1
+  make sigmund >/dev/null || return 1
+  [ -f ./sigmund ] || return 1
+  make sigmund-dynamic >/dev/null || return 1
+  [ -f ./sigmund ] && [ -f ./sigmund-dynamic ]
+}
+
 set -e
 run_test "start/stop lifecycle" test_lifecycle
 run_test "kill subcommand kills process group" test_kill_subcommand
 run_test "start output includes stop helper" test_start_output_stop_hint
 run_test "stop kills full process group (children)" test_group_kill_children
 run_test "exec failure creates no record" test_exec_failure_no_record
-run_test "fast exit command is recorded as dead" test_fast_exit_record_dead
+run_test "fast exit command is recorded as exited" test_fast_exit_record_exited
 run_test "corrupt record warning and prune cleanup" test_corrupt_record_handling
 run_test "invalid pgid=0 record is not listed as running" test_invalid_pgid_record
-run_test "orphan logs are removed by prune" test_orphan_log_cleanup
 run_test "ID input sanitization rejects invalid ids" test_id_sanitization
 run_test "killcmd prints group kill command" test_killcmd_output
 run_test "stop supports multiple IDs in one command" test_stop_multiple_ids
@@ -300,6 +383,12 @@ run_test "special characters are preserved in argv JSON" test_special_chars_args
 run_test "logging captures stdout+stderr" test_log_capture
 run_test "tail <id> tails an existing run log" test_tail_verb_existing_id
 run_test "concurrent starts produce unique ids" test_concurrent_unique_ids
+run_test "list prints RUNID/STATE/STARTED_AT/RESULT/CMD" test_list_columns
+run_test "records persist and become stale across boot id change" test_persistent_stale_records
+run_test "prune <runid> removes exactly one record and log" test_prune_by_id
+run_test "prune all removes prunable records but keeps running runs" test_prune_all_preserves_running
+run_test "record write failure rolls back launched process" test_transactional_record_write_failure
+run_test "static and dynamic build artifacts coexist" test_build_artifacts_coexist
 
 if [ "$FAILS" -ne 0 ]; then
   exit 1
