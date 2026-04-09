@@ -20,7 +20,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define ID_HEX_LEN 6
+#define ID_HEX_LEN 8
 #define STOP_TIMEOUT_MS 5000
 #define POLL_SLEEP_MS 25
 #ifndef SIGMUND_VERSION
@@ -49,11 +49,21 @@ struct record {
     uint64_t exe_dev;
     uint64_t exe_ino;
     char cmdline[SIGMUND_PATH_MAX];
+    char started_at[64];
+    char ended_at[64];
+    char state[32];
+    int exit_code;
+    int term_signal;
+    char launch_error[64];
     bool has_log;
     bool has_boot;
+    bool has_ended_at;
+    bool has_exit_code;
+    bool has_term_signal;
+    bool has_launch_error;
 };
 
-enum run_state { STATE_RUNNING, STATE_DEAD, STATE_STALE, STATE_UNKNOWN };
+enum run_state { STATE_RUNNING, STATE_EXITED, STATE_STALE, STATE_FAILED, STATE_UNKNOWN };
 
 static volatile sig_atomic_t g_tail_interrupted = 0;
 static int write_all(int fd, const void *buf, size_t n);
@@ -97,25 +107,6 @@ static bool valid_id(const char *id) {
         }
     }
     return true;
-}
-
-static bool is_hidden_id_artifact(const char *name, const char *suffix) {
-    size_t nl = strlen(name);
-    size_t sl = strlen(suffix);
-    if (nl <= 1 + sl || name[0] != '.') {
-        return false;
-    }
-    if (strcmp(name + (nl - sl), suffix) != 0) {
-        return false;
-    }
-    size_t id_len = nl - 1 - sl;
-    if (id_len >= 32) {
-        return false;
-    }
-    char id[32];
-    memcpy(id, name + 1, id_len);
-    id[id_len] = '\0';
-    return valid_id(id);
 }
 
 static bool valid_record(const struct record *r) {
@@ -270,82 +261,6 @@ static int ensure_storage(char *dir, size_t n) {
     return 0;
 }
 
-static int maybe_cleanup_for_boot(const char *dir) {
-    char current_boot[128];
-    if (get_boot_id(current_boot, sizeof(current_boot)) != 0) {
-        return 0;
-    }
-    char marker[SIGMUND_PATH_MAX];
-    if (checked_snprintf(marker, sizeof(marker), "%s/.boot_id", dir) != 0) {
-        return -1;
-    }
-    char prev_boot[128] = {0};
-    bool had_marker = read_file_trim(marker, prev_boot, sizeof(prev_boot)) == 0 && prev_boot[0] != '\0';
-    bool should_write_marker = !had_marker;
-    if (had_marker && strcmp(prev_boot, current_boot) != 0) {
-        should_write_marker = true;
-        DIR *d = opendir(dir);
-        if (!d) {
-            return -1;
-        }
-        const struct dirent *e;
-        while ((e = readdir(d))) {
-            const char *name = e->d_name;
-            if (!strcmp(name, ".") || !strcmp(name, "..") || !strcmp(name, ".boot_id")) {
-                continue;
-            }
-            bool rm = has_suffix(name, ".json") || has_suffix(name, ".log") ||
-                      is_hidden_id_artifact(name, ".reserve") ||
-                      is_hidden_id_artifact(name, ".tmp");
-            if (rm) {
-                char p[SIGMUND_PATH_MAX];
-                if (checked_snprintf(p, sizeof(p), "%s/%s", dir, name) == 0) {
-                    unlink(p);
-                }
-            }
-        }
-        closedir(d);
-    }
-    if (!should_write_marker) {
-        return 0;
-    }
-
-    char marker_tmp[SIGMUND_PATH_MAX];
-    if (checked_snprintf(marker_tmp, sizeof(marker_tmp), "%s/.boot_id.tmp", dir) != 0) {
-        return -1;
-    }
-    int fd = open(marker_tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-    if (fd < 0) {
-        return -1;
-    }
-    if (write_all(fd, current_boot, strlen(current_boot)) != 0) {
-        close(fd);
-        return -1;
-    }
-    if (fchmod(fd, 0600) != 0) {
-        close(fd);
-        return -1;
-    }
-    if (fsync(fd) != 0) {
-        close(fd);
-        return -1;
-    }
-    close(fd);
-    if (rename(marker_tmp, marker) != 0) {
-        int re = errno;
-        unlink(marker_tmp);
-        if (re == ENOENT || re == EEXIST) {
-            char chk[128] = {0};
-            if (read_file_trim(marker, chk, sizeof(chk)) == 0 && strcmp(chk, current_boot) == 0) {
-                return 0;
-            }
-        }
-        errno = re;
-        return -1;
-    }
-    return 0;
-}
-
 static int write_all(int fd, const void *buf, size_t n) {
     const char *p = buf;
     while (n > 0) {
@@ -360,6 +275,13 @@ static int write_all(int fd, const void *buf, size_t n) {
         n -= (size_t)w;
     }
     return 0;
+}
+
+static void now_rfc3339(char *out, size_t n) {
+    time_t t = time(NULL);
+    struct tm tmv;
+    gmtime_r(&t, &tmv);
+    strftime(out, n, "%Y-%m-%dT%H:%M:%SZ", &tmv);
 }
 
 static void json_escape(FILE *f, const char *s) {
@@ -412,6 +334,10 @@ static int write_record_atomic(const char *dir, const struct record *r, int argc
     if (checked_snprintf(reserve, sizeof(reserve), "%s/.%s.reserve", dir, r->id) != 0) {
         return -1;
     }
+    if (getenv("SIGMUND_TEST_FAIL_RECORD_WRITE")) {
+        errno = EIO;
+        return -1;
+    }
 
     fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
     if (fd < 0) {
@@ -433,6 +359,12 @@ static int write_record_atomic(const char *dir, const struct record *r, int argc
     fprintf(f, "  \"pgid\": %ld,\n", (long)r->pgid);
     fprintf(f, "  \"sid\": %ld,\n", (long)r->sid);
     fprintf(f, "  \"start_unix_ns\": %" PRId64 ",\n", r->start_unix_ns);
+    fprintf(f, "  \"started_at\": \"");
+    json_escape(f, r->started_at);
+    fprintf(f, "\",\n");
+    fprintf(f, "  \"state\": \"");
+    json_escape(f, r->state);
+    fprintf(f, "\",\n");
     fprintf(f, "  \"argv\": ");
     write_json_argv(f, argc, argv);
     fprintf(f, ",\n");
@@ -449,6 +381,22 @@ static int write_record_atomic(const char *dir, const struct record *r, int argc
     if (r->has_boot) {
         fprintf(f, "  \"boot_id\": \"");
         json_escape(f, r->boot_id);
+        fprintf(f, "\",\n");
+    }
+    if (r->has_ended_at) {
+        fprintf(f, "  \"ended_at\": \"");
+        json_escape(f, r->ended_at);
+        fprintf(f, "\",\n");
+    }
+    if (r->has_exit_code) {
+        fprintf(f, "  \"exit_code\": %d,\n", r->exit_code);
+    }
+    if (r->has_term_signal) {
+        fprintf(f, "  \"term_signal\": %d,\n", r->term_signal);
+    }
+    if (r->has_launch_error) {
+        fprintf(f, "  \"launch_error\": \"");
+        json_escape(f, r->launch_error);
         fprintf(f, "\",\n");
     }
     fprintf(f, "  \"proc_starttime_ticks\": %" PRIu64 ",\n", r->proc_starttime_ticks);
@@ -1018,6 +966,12 @@ static int load_record(const char *path, struct record *r) {
         free(j);
         return -1;
     }
+    if (json_get_str(j, "started_at", r->started_at, sizeof(r->started_at)) != 0) {
+        r->started_at[0] = '\0';
+    }
+    if (json_get_str(j, "state", r->state, sizeof(r->state)) != 0) {
+        snprintf(r->state, sizeof(r->state), "running");
+    }
     if (json_get_i64(j, "uid", &tmp) != 0) {
         free(j);
         return -1;
@@ -1034,6 +988,20 @@ static int load_record(const char *path, struct record *r) {
     if (json_get_str(j, "boot_id", r->boot_id, sizeof(r->boot_id)) == 0) {
         r->has_boot = true;
     }
+    if (json_get_str(j, "ended_at", r->ended_at, sizeof(r->ended_at)) == 0) {
+        r->has_ended_at = true;
+    }
+    if (json_get_i64(j, "exit_code", &tmp) == 0) {
+        r->exit_code = (int)tmp;
+        r->has_exit_code = true;
+    }
+    if (json_get_i64(j, "term_signal", &tmp) == 0) {
+        r->term_signal = (int)tmp;
+        r->has_term_signal = true;
+    }
+    if (json_get_str(j, "launch_error", r->launch_error, sizeof(r->launch_error)) == 0) {
+        r->has_launch_error = true;
+    }
     if (json_get_u64(j, "proc_starttime_ticks", &r->proc_starttime_ticks) != 0 ||
         json_get_u64(j, "exe_dev", &r->exe_dev) != 0 ||
         json_get_u64(j, "exe_ino", &r->exe_ino) != 0) {
@@ -1049,6 +1017,66 @@ static int load_record(const char *path, struct record *r) {
     return 0;
 }
 
+static int status_path_for(const char *dir, const char *id, char *out, size_t n) {
+    return checked_snprintf(out, n, "%s/%s.status", dir, id);
+}
+
+static int write_status_atomic(const char *dir, const char *id, int exit_code, int term_signal, const char *ended_at) {
+    char path[SIGMUND_PATH_MAX], tmp[SIGMUND_PATH_MAX];
+    if (status_path_for(dir, id, path, sizeof(path)) != 0) {
+        return -1;
+    }
+    if (checked_snprintf(tmp, sizeof(tmp), "%s/.%s.status.tmp", dir, id) != 0) {
+        return -1;
+    }
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        return -1;
+    }
+    dprintf(fd, "ended_at=%s\nexit_code=%d\nterm_signal=%d\n", ended_at, exit_code, term_signal);
+    if (fsync(fd) != 0) {
+        close(fd);
+        unlink(tmp);
+        return -1;
+    }
+    close(fd);
+    if (rename(tmp, path) != 0) {
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+static void apply_status_file(const char *dir, struct record *r) {
+    char path[SIGMUND_PATH_MAX];
+    if (status_path_for(dir, r->id, path, sizeof(path)) != 0) {
+        return;
+    }
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return;
+    }
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "ended_at=", 9) == 0) {
+            char *v = line + 9;
+            v[strcspn(v, "\r\n")] = '\0';
+            if (*v) {
+                if (checked_snprintf(r->ended_at, sizeof(r->ended_at), "%s", v) == 0) {
+                    r->has_ended_at = true;
+                }
+            }
+        } else if (strncmp(line, "exit_code=", 10) == 0) {
+            r->exit_code = atoi(line + 10);
+            r->has_exit_code = true;
+        } else if (strncmp(line, "term_signal=", 12) == 0) {
+            r->term_signal = atoi(line + 12);
+            r->has_term_signal = true;
+        }
+    }
+    fclose(f);
+}
+
 static enum run_state eval_state(const struct record *r, const char *current_boot) {
     if (r->pgid <= 1) {
         return STATE_UNKNOWN;
@@ -1061,7 +1089,7 @@ static enum run_state eval_state(const struct record *r, const char *current_boo
     bool has_stat = read_proc_stat_tokens(r->pid, &state, &now_starttime) == 0;
     bool present = has_stat || leader_present(r->pid);
     if (has_stat && state == 'Z') {
-        return STATE_DEAD;
+        return STATE_EXITED;
     }
     if (present) {
         if (r->proc_starttime_ticks && has_stat) {
@@ -1082,7 +1110,10 @@ static enum run_state eval_state(const struct record *r, const char *current_boo
         return STATE_RUNNING;
     }
     if (g == 0) {
-        return STATE_DEAD;
+        if (r->has_launch_error) {
+            return STATE_FAILED;
+        }
+        return STATE_EXITED;
     }
     return STATE_UNKNOWN;
 }
@@ -1144,7 +1175,6 @@ static int tail_log_until_exit(const struct record *r, bool from_end) {
 }
 
 static int perform_start(const char *dir, bool tail, int argc, char **argv) {
-
     char id[16], log_path[SIGMUND_PATH_MAX], reserve_path[SIGMUND_PATH_MAX], boot_id[128] = {0};
     bool has_boot = get_boot_id(boot_id, sizeof(boot_id)) == 0;
     if (gen_id(dir, id, sizeof(id)) != 0) {
@@ -1168,11 +1198,11 @@ static int perform_start(const char *dir, bool tail, int argc, char **argv) {
         fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
         fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
     }
-    pid_t pid = fork();
-    if (pid < 0) {
+    pid_t launcher_pid = fork();
+    if (launcher_pid < 0) {
         die_errno("sigmund: fork failed");
     }
-    if (pid == 0) {
+    if (launcher_pid == 0) {
         close(pipefd[0]);
         if (setsid() < 0) {
             int e = errno;
@@ -1198,10 +1228,33 @@ static int perform_start(const char *dir, bool tail, int argc, char **argv) {
         if (lfd > 2) {
             close(lfd);
         }
-        execvp(argv[0], argv);
-        int e = errno;
-        write_all(pipefd[1], &e, sizeof(e));
-        _exit(127);
+
+        pid_t worker = fork();
+        if (worker < 0) {
+            int e = errno;
+            write_all(pipefd[1], &e, sizeof(e));
+            _exit(127);
+        }
+        if (worker == 0) {
+            execvp(argv[0], argv);
+            int e = errno;
+            write_all(pipefd[1], &e, sizeof(e));
+            _exit(127);
+        }
+        close(pipefd[1]);
+        int st = 0;
+        if (waitpid(worker, &st, 0) > 0) {
+            int exit_code = -1, term_signal = 0;
+            if (WIFEXITED(st)) {
+                exit_code = WEXITSTATUS(st);
+            } else if (WIFSIGNALED(st)) {
+                term_signal = WTERMSIG(st);
+            }
+            char ended_at[64];
+            now_rfc3339(ended_at, sizeof(ended_at));
+            write_status_atomic(dir, id, exit_code, term_signal, ended_at);
+        }
+        _exit(0);
     }
 
     close(pipefd[1]);
@@ -1210,7 +1263,7 @@ static int perform_start(const char *dir, bool tail, int argc, char **argv) {
     close(pipefd[0]);
     if (n > 0) {
         int st;
-        waitpid(pid, &st, 0);
+        waitpid(launcher_pid, &st, 0);
         fprintf(stderr, "sigmund: exec failed: %s\n", strerror(child_errno));
         unlink(reserve_path);
         return 1;
@@ -1221,14 +1274,16 @@ static int perform_start(const char *dir, bool tail, int argc, char **argv) {
     if (checked_snprintf(r.id, sizeof(r.id), "%s", id) != 0) {
         die_errno("sigmund: id too long");
     }
-    r.pid = pid;
-    r.pgid = pid;
-    r.sid = pid;
+    r.pid = launcher_pid;
+    r.pgid = launcher_pid;
+    r.sid = launcher_pid;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     r.start_unix_ns = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
     r.uid = getuid();
     r.gid = getgid();
+    now_rfc3339(r.started_at, sizeof(r.started_at));
+    snprintf(r.state, sizeof(r.state), "running");
     r.has_log = true;
     if (checked_snprintf(r.log_path, sizeof(r.log_path), "%s", log_path) != 0) {
         die_errno("sigmund: log path too long");
@@ -1237,8 +1292,8 @@ static int perform_start(const char *dir, bool tail, int argc, char **argv) {
     if (r.has_boot) {
         snprintf(r.boot_id, sizeof(r.boot_id), "%s", boot_id);
     }
-    read_proc_stat_tokens(pid, NULL, &r.proc_starttime_ticks);
-    read_proc_exe(pid, &r.exe_dev, &r.exe_ino);
+    read_proc_stat_tokens(launcher_pid, NULL, &r.proc_starttime_ticks);
+    read_proc_exe(launcher_pid, &r.exe_dev, &r.exe_ino);
     size_t off = 0;
     r.cmdline[0] = '\0';
     for (int i = 0; i < argc; i++) {
@@ -1254,6 +1309,8 @@ static int perform_start(const char *dir, bool tail, int argc, char **argv) {
         }
     }
     if (write_record_atomic(dir, &r, argc, argv, NULL, 0) != 0) {
+        kill(-r.pgid, SIGKILL);
+        waitpid(launcher_pid, NULL, 0);
         unlink(reserve_path);
         die_errno("sigmund: failed to write record");
     }
@@ -1269,11 +1326,45 @@ static int perform_start(const char *dir, bool tail, int argc, char **argv) {
     return 0;
 }
 
-static int load_record_by_id(const char *dir, const char *id, struct record *r, char *path, size_t n) {
-    if (!valid_id(id)) {
+static int resolve_run_id(const char *dir, const char *in, char *resolved, size_t n) {
+    if (!in || !*in || strlen(in) > 10) {
         return -1;
     }
-    if (checked_snprintf(path, n, "%s/%s.json", dir, id) != 0) {
+    if (valid_id(in)) {
+        char path[SIGMUND_PATH_MAX];
+        if (checked_snprintf(path, sizeof(path), "%s/%s.json", dir, in) == 0 && access(path, F_OK) == 0) {
+            return checked_snprintf(resolved, n, "%s", in);
+        }
+    }
+    DIR *d = opendir(dir);
+    if (!d) return -1;
+    const struct dirent *e;
+    char match[16] = {0};
+    int count = 0;
+    while ((e = readdir(d))) {
+        if (!has_suffix(e->d_name, ".json")) continue;
+        size_t id_len = strlen(e->d_name) - 5;
+        if (id_len >= sizeof(match)) continue;
+        char id[16] = {0};
+        memcpy(id, e->d_name, id_len);
+        if (strncmp(id, in, strlen(in)) == 0) {
+            snprintf(match, sizeof(match), "%s", id);
+            count++;
+        }
+    }
+    closedir(d);
+    if (count == 1) {
+        return checked_snprintf(resolved, n, "%s", match);
+    }
+    return -1;
+}
+
+static int load_record_by_id(const char *dir, const char *id, struct record *r, char *path, size_t n) {
+    char resolved[16];
+    if (resolve_run_id(dir, id, resolved, sizeof(resolved)) != 0) {
+        return -1;
+    }
+    if (checked_snprintf(path, n, "%s/%s.json", dir, resolved) != 0) {
         return -1;
     }
     if (load_record(path, r) != 0) {
@@ -1293,14 +1384,16 @@ static int do_signal_action(const char *dir, const char *id, int sig, bool grace
         return 5;
     }
     if (r.has_boot && get_boot_id(boot, sizeof(boot)) == 0 && strcmp(r.boot_id, boot) != 0) {
+        fprintf(stderr, "sigmund: error: run %s is stale (from prior boot); refusing to signal\n", id);
         return 2;
     }
 
     enum run_state st = eval_state(&r, r.has_boot ? boot : NULL);
     if (st == STATE_STALE) {
+        fprintf(stderr, "sigmund: error: run %s is stale (from prior boot); refusing to signal\n", id);
         return 2;
     }
-    if (st == STATE_DEAD) {
+    if (st == STATE_EXITED || st == STATE_FAILED) {
         return 0;
     }
 
@@ -1348,34 +1441,28 @@ static const char *state_str(enum run_state s) {
     switch (s) {
     case STATE_RUNNING:
         return "running";
-    case STATE_DEAD:
-        return "dead";
+    case STATE_EXITED:
+        return "exited";
     case STATE_STALE:
         return "stale";
+    case STATE_FAILED:
+        return "failed";
     default:
         return "unknown";
     }
 }
 
-static void format_age(int64_t start_ns, char *out, size_t n) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    int64_t now = (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
-    int64_t sec = (now - start_ns) / 1000000000LL;
-    if (sec < 0) {
-        sec = 0;
-    }
-    int64_t days = sec / 86400;
-    int64_t hours = (sec % 86400) / 3600;
-    int64_t mins = (sec % 3600) / 60;
-    if (days > 0) {
-        snprintf(out, n, "%" PRId64 "d%" PRId64 "h", days, hours);
-    } else if (hours > 0) {
-        snprintf(out, n, "%" PRId64 "h%" PRId64 "m", hours, mins);
-    } else if (mins > 0) {
-        snprintf(out, n, "%" PRId64 "m", mins);
+static void format_result(const struct record *r, enum run_state st, char *out, size_t n) {
+    if (st == STATE_RUNNING) {
+        snprintf(out, n, "-");
+    } else if (r->has_launch_error) {
+        checked_snprintf(out, n, "launch=%s", r->launch_error);
+    } else if (r->has_term_signal && r->term_signal > 0) {
+        snprintf(out, n, "signal=%d", r->term_signal);
+    } else if (r->has_exit_code && r->exit_code >= 0) {
+        snprintf(out, n, "exit=%d", r->exit_code);
     } else {
-        snprintf(out, n, "%" PRId64 "s", sec);
+        snprintf(out, n, "-");
     }
 }
 
@@ -1386,7 +1473,7 @@ static int cmd_list(const char *dir) {
     }
     char boot[128] = {0};
     get_boot_id(boot, sizeof(boot));
-    printf("%-7s %-8s %-8s %-6s %-8s %s\n", "ID", "PID", "PGID", "AGE", "STATE", "CMD");
+    printf("%-10s %-8s %-22s %-14s %s\n", "RUNID", "STATE", "STARTED_AT", "RESULT", "CMD");
     const struct dirent *e;
     while ((e = readdir(d))) {
         if (!has_suffix(e->d_name, ".json")) {
@@ -1404,9 +1491,10 @@ static int cmd_list(const char *dir) {
             fprintf(stderr, "sigmund: warning: skipping corrupt record %s\n", e->d_name);
             continue;
         }
+        apply_status_file(dir, &r);
         enum run_state st = eval_state(&r, r.has_boot ? boot : NULL);
-        char age[32];
-        format_age(r.start_unix_ns, age, sizeof(age));
+        char result[64];
+        format_result(&r, st, result, sizeof(result));
         char cmd[64];
         if (checked_snprintf(cmd, sizeof(cmd), "%s", r.cmdline[0] ? r.cmdline : "?") != 0) {
             continue;
@@ -1415,19 +1503,44 @@ static int cmd_list(const char *dir) {
             cmd[48] = '\0';
             strcat(cmd, "...");
         }
-        printf("%-7s %-8ld %-8ld %-6s %-8s %s\n", r.id, (long)r.pid, (long)r.pgid, age, state_str(st), cmd);
+        printf("%-10s %-8s %-22s %-14s %s\n",
+               r.id,
+               state_str(st),
+               r.started_at[0] ? r.started_at : "-",
+               result,
+               cmd);
     }
     closedir(d);
     return 0;
 }
 
-static int cmd_prune(const char *dir) {
+static int rm_record_bundle(const char *dir, const struct record *r, const char *json_path) {
+    unlink(json_path);
+    if (r->has_log) {
+        unlink(r->log_path);
+    }
+    char status_path[SIGMUND_PATH_MAX];
+    if (status_path_for(dir, r->id, status_path, sizeof(status_path)) == 0) {
+        unlink(status_path);
+    }
+    return 0;
+}
+
+static int cmd_prune(const char *dir, const char *target) {
     DIR *d = opendir(dir);
     if (!d) {
         return 0;
     }
     char boot[128] = {0};
     get_boot_id(boot, sizeof(boot));
+    bool prune_all = !target || strcmp(target, "all") == 0;
+    char prune_id[16] = {0};
+    if (!prune_all && resolve_run_id(dir, target, prune_id, sizeof(prune_id)) != 0) {
+        fprintf(stderr, "sigmund: error: no unique run matched prune target: %s\n", target);
+        closedir(d);
+        return 5;
+    }
+    bool matched = false;
     const struct dirent *e;
     while ((e = readdir(d))) {
         if (!has_suffix(e->d_name, ".json")) {
@@ -1446,11 +1559,19 @@ static int cmd_prune(const char *dir) {
             unlink(path);
             continue;
         }
-        if (eval_state(&r, r.has_boot ? boot : NULL) == STATE_DEAD) {
-            unlink(path);
-            if (r.has_log) {
-                unlink(r.log_path);
-            }
+        apply_status_file(dir, &r);
+        enum run_state st = eval_state(&r, r.has_boot ? boot : NULL);
+        bool prunable = (st == STATE_STALE || st == STATE_EXITED || st == STATE_FAILED);
+        if (!prune_all) {
+            size_t nlen = strlen(e->d_name);
+            if (nlen <= 5) continue;
+            char id[16] = {0};
+            memcpy(id, e->d_name, nlen - 5);
+            if (strcmp(id, prune_id) != 0) continue;
+            matched = true;
+        }
+        if (prunable) {
+            rm_record_bundle(dir, &r, path);
         }
     }
     rewinddir(d);
@@ -1484,6 +1605,10 @@ static int cmd_prune(const char *dir) {
         }
     }
     closedir(d);
+    if (!prune_all && !matched) {
+        fprintf(stderr, "sigmund: error: run %s is not prunable (must be stale/exited/failed)\n", prune_id);
+        return 5;
+    }
     return 0;
 }
 
@@ -1499,7 +1624,10 @@ static void usage(void) {
            "  sigmund stop <id>...          graceful stop (SIGTERM → SIGKILL)\n"
            "  sigmund kill <id>...          immediate kill (SIGKILL)\n"
            "  sigmund killcmd <id>...       print kill command for scripting\n"
-           "  sigmund prune                 remove dead records and logs\n"
+           "  sigmund dump <id>             print saved log output and exit\n"
+           "  sigmund prune                 remove prunable records (stale/exited/failed)\n"
+           "  sigmund prune <id>            remove one prunable record and output\n"
+           "  sigmund prune all             remove all prunable records and output\n"
            "\n"
            "switches:\n"
            "  --tail                        start-mode switch (use with <cmd...>)\n"
@@ -1520,10 +1648,6 @@ int main(int argc, char **argv) {
     if (ensure_storage(dir, sizeof(dir)) != 0) {
         die_errno("sigmund: failed to init storage");
     }
-    if (maybe_cleanup_for_boot(dir) != 0) {
-        die_errno("sigmund: failed to perform boot cleanup");
-    }
-
     int argi = 1;
     if (!strcmp(argv[argi], "--tail")) {
         argi++;
@@ -1565,12 +1689,50 @@ int main(int argc, char **argv) {
         }
         return tail_log_until_exit(&r, true);
     }
+    if (!strcmp(argv[argi], "dump")) {
+        if (argi + 1 >= argc) {
+            fprintf(stderr, "usage: sigmund dump <id>\n");
+            return 5;
+        }
+        struct record r;
+        char path[SIGMUND_PATH_MAX];
+        if (load_record_by_id(dir, argv[argi + 1], &r, path, sizeof(path)) != 0) {
+            return 5;
+        }
+        if (!r.has_log) {
+            fprintf(stderr, "sigmund: record has no log path: %s\n", argv[argi + 1]);
+            return 5;
+        }
+        int fd = open(r.log_path, O_RDONLY);
+        if (fd < 0) {
+            die_errno("sigmund: failed to open log for dump");
+        }
+        char buf[4096];
+        while (1) {
+            ssize_t nr = read(fd, buf, sizeof(buf));
+            if (nr == 0) break;
+            if (nr < 0) {
+                if (errno == EINTR) continue;
+                close(fd);
+                die_errno("sigmund: failed while dumping log");
+            }
+            if (write_all(STDOUT_FILENO, buf, (size_t)nr) != 0) {
+                close(fd);
+                die_errno("sigmund: failed while writing dump output");
+            }
+        }
+        close(fd);
+        return 0;
+    }
 
     if (!strcmp(argv[argi], "list")) {
         return cmd_list(dir);
     }
     if (!strcmp(argv[argi], "prune")) {
-        return cmd_prune(dir);
+        if (argi + 1 >= argc) {
+            return cmd_prune(dir, "all");
+        }
+        return cmd_prune(dir, argv[argi + 1]);
     }
     if (!strcmp(argv[argi], "stop")) {
         if (argi + 1 >= argc) {
@@ -1616,7 +1778,13 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "sigmund: error: invalid pgid %ld in record file\n", (long)r.pgid);
                 rc = 5;
             } else {
-                printf("kill -TERM -- -%ld\n", (long)r.pgid);
+                char boot[128] = {0};
+                if (r.has_boot && get_boot_id(boot, sizeof(boot)) == 0 && strcmp(r.boot_id, boot) != 0) {
+                    fprintf(stderr, "sigmund: error: run %s is stale (from prior boot); refusing killcmd\n", argv[i]);
+                    rc = 2;
+                } else {
+                    printf("kill -TERM -- -%ld\n", (long)r.pgid);
+                }
             }
             if (rc > worst) {
                 worst = rc;
