@@ -338,7 +338,7 @@ test_transactional_record_write_failure() {
 
 test_build_artifact_coexistence() {
   make clean >/dev/null || return 1
-  make sigmund >/dev/null || return 1
+  make sigmund STATIC_LDFLAGS= >/dev/null || return 1
   [ -x ./sigmund ] || return 1
   make sigmund-dynamic >/dev/null || return 1
   [ -x ./sigmund ] && [ -x ./sigmund-dynamic ] || return 1
