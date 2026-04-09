@@ -39,26 +39,32 @@ jobs:
             dockcross_image: ""
             make_target: sigmund
             static_ldflags: -static
+            package_binary: sigmund
           - target: linux-amd64-gnu-dynamic
             dockcross_image: ""
             make_target: sigmund-dynamic
             static_ldflags: ''
+            package_binary: sigmund-dynamic
           - target: linux-arm64-gnu-static
             dockcross_image: dockcross/linux-arm64
             make_target: sigmund
             static_ldflags: -static
+            package_binary: sigmund
           - target: linux-arm64-gnu-dynamic
             dockcross_image: dockcross/linux-arm64
             make_target: sigmund-dynamic
             static_ldflags: ''
+            package_binary: sigmund-dynamic
           - target: linux-armhf-gnu-static
             dockcross_image: dockcross/linux-armv7
             make_target: sigmund
             static_ldflags: -static
+            package_binary: sigmund
           - target: linux-armhf-gnu-dynamic
             dockcross_image: dockcross/linux-armv7
             make_target: sigmund-dynamic
             static_ldflags: ''
+            package_binary: sigmund-dynamic
     steps:
       - uses: actions/checkout@v4
 
@@ -88,7 +94,7 @@ jobs:
       - name: Package tarball
         run: |
           mkdir -p dist
-          ./.github/scripts/package_tarball.sh "${{ matrix.target }}" "${{ steps.version.outputs.value }}" sigmund dist
+          ./.github/scripts/package_tarball.sh "${{ matrix.target }}" "${{ steps.version.outputs.value }}" "${{ matrix.package_binary }}" dist
 
       - name: Upload GNU artifact
         uses: actions/upload-artifact@v4

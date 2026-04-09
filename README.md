@@ -1,8 +1,8 @@
 # sigmund
 
-**A tiny, daemonless process supervisor and background job protector.**
+**A tiny, daemonless process launcher and recorder.**
 
-`sigmund` is a lightweight launcher that protects detached processes from CI/runner process-group cleanup and gives you a durable, safe handle to manage them later. 
+`sigmund` is a lightweight launcher that protects detached processes from CI/runner process-group cleanup and gives you a durable, safe handle to manage them later.
 
 Many CI runners (like GitHub Actions or GitLab CI) and non-interactive job systems terminate the invoking shell’s **process group** at step completion. If you start a long-running process (like QEMU, a test database, or a web server) in the background using standard shell tools like `nohup cmd &`, it will be killed the moment the step finishes. 
 
@@ -22,7 +22,7 @@ Many CI runners (like GitHub Actions or GitLab CI) and non-interactive job syste
 **Build:**
 Requires a C11 compiler. Linux-first (relies on `/proc` for identity validation).
 
-By default, `make` produces a **static** standalone binary (`-static`) so it does not depend on the host glibc version at runtime.
+By default, `make` produces a **static** standalone binary (`-static`) named `sigmund`, so it does not depend on the host glibc version at runtime.
 
 ```bash
 make
@@ -30,6 +30,7 @@ make
 
 # Optional: build a dynamically linked binary instead (smaller, host-glibc dependent)
 make sigmund-dynamic
+# output: ./sigmund-dynamic
 ```
 
 For cross-platform CI and releases, build and publish both variants:
@@ -47,8 +48,8 @@ sigmund: stop: sigmund stop 7f3c2a
 
 # List tracked runs
 $ sigmund list
-ID      PID      PGID     AGE    STATE    CMD
-7f3c2a  4012     4012     12s    running  qemu-system-x86_64 -m 4096...
+RUNID      STATE    STARTED_AT               RESULT         CMD
+7f3c2a     running  2026-04-09T18:42:11Z     -              qemu-system-x86_64 -m 4096...
 
 # Stop the run cleanly (sends SIGTERM, waits, then SIGKILL if needed)
 $ sigmund stop 7f3c2a
@@ -112,12 +113,15 @@ sigmund list
 
 | Command                | Description                                                                                    |
 |------------------------|------------------------------------------------------------------------------------------------|
-| `sigmund list`         | Lists all tracked runs, their PIDs, age, state, and command.                                  |
+| `sigmund list`         | Lists all tracked runs with `RUNID`, `STATE`, `STARTED_AT`, `RESULT`, and `CMD`.              |
 | `sigmund tail <id>`    | Follows the log for an already-running tracked process.                                        |
+| `sigmund dump <id>`    | Prints the saved output log for a run and exits (works for stale runs if log exists).         |
 | `sigmund stop <id>`    | Gracefully stops a run. Sends `SIGTERM` to the group, waits up to 5s, then sends `SIGKILL`.  |
 | `sigmund kill <id>`    | Forcefully kills a run immediately using `SIGKILL`.                                            |
-| `sigmund killcmd <id>` | Prints the raw shell command needed to signal the process group (e.g., `kill -TERM -- -4012`). |
-| `sigmund prune`        | Cleans up the state files and logs for processes that are natively `dead`.                    |
+| `sigmund killcmd <id>` | Prints the raw shell command needed to signal the process group (e.g., `kill -TERM -- -4012`). Refuses stale runs. |
+| `sigmund prune`        | Backward-compatible cleanup: removes exited/failed records and orphan logs.                    |
+| `sigmund prune <id>`   | Removes exactly one prunable run record and its associated log/output.                         |
+| `sigmund prune all`    | Removes all prunable runs (`stale`, `exited`, `failed`) and their associated output.          |
 
 ### Switches
 
@@ -143,7 +147,7 @@ Press Ctrl-C to detach from tailing while the background process keeps running.
 
 ## Architecture & Safety Guarantees
 
-`sigmund` tracks state in `~/.local/state/sigmund`. This is intentionally a persistent per-user location rather than `$XDG_RUNTIME_DIR`, because persistent state/logs are more predictable across shells, CI environments, WSL setups, and hosts where XDG runtime handling is inconsistent. All state updates use atomic file renames (`rename()` + `fsync()`) so records are never corrupted, even during power loss.
+`sigmund` tracks state in `~/.local/state/sigmund`. This is intentionally a persistent per-user location rather than `$XDG_RUNTIME_DIR`, because persistent state/logs are more predictable across shells, CI environments, WSL setups, and hosts where XDG runtime handling is inconsistent. Records and logs survive reboot; launched processes do not. All state updates use atomic file renames (`rename()` + `fsync()`) so records are never corrupted, even during power loss.
 
 **Strict Identity Validation:**
 Before sending *any* signal, `sigmund` checks:
@@ -151,7 +155,9 @@ Before sending *any* signal, `sigmund` checks:
 2. Does `/proc/<pid>/stat` start-time match? (Prevents signaling if the PID rolled over and was reassigned).
 3. Do the executable device/inode numbers in `/proc/<pid>/exe` match? (Prevents signaling if a different binary took the PID).
 
-If any check fails, the state evaluates as `stale` and signals are blocked.
+If any check fails (including boot mismatch), the state evaluates as `stale` and signals are blocked (`stop`, `kill`, `killcmd` all refuse stale runs). Stale records remain visible in `list` until explicitly pruned.
+
+`sigmund` does **not** restart processes after reboot and is **not** a supervisor.
 
 **Edge Cases Handled:**
 * If the original leader PID exits but child processes in the group remain alive, `sigmund stop` still targets the group safely.
