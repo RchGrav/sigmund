@@ -44,29 +44,30 @@ sigmund: stop: sigmund stop 7f3c2a
 
     sigmund --tail <cmd> [args...]
     sigmund tail <id>
+    sigmund dump <id>
 
 `sigmund --tail <cmd> [args...]` launches the command identically to `sigmund <cmd>` (backgrounded, log file, new session), then tails the log file to stdout.
 
 `sigmund tail <id>` tails the log for an already-running tracked process.
+
+`sigmund dump <id>` prints the saved log output for that run and exits (including stale runs when logs exist).
 
 Ctrl-C detaches from tailing — the background process keeps running.
 
 ### List
 
 ```
-sigmund -l
-sigmund --list
+sigmund list
 ```
 
 Lists run records and their status.
 
 Columns (stable):
 
-* `ID`
-* `PID`
-* `PGID`
-* `AGE`
-* `STATE` (`running`, `dead`, `stale`, `unknown`)
+* `RUNID`
+* `STATE` (`running`, `exited`, `stale`, `failed`, `unknown`)
+* `STARTED_AT` (RFC3339 UTC)
+* `RESULT` (`-`, `exit=<code>`, `signal=<sig>`, `launch=<reason>`)
 * `CMD` (truncated)
 
 ### Stop
@@ -107,9 +108,17 @@ Exit codes follow `stop`.
 
 ```
 sigmund prune
+sigmund prune <id>
+sigmund prune all
 ```
 
-Removes run records that are `dead`. Records in `stale` or `unknown` state are retained.
+`prune` is explicit cleanup and never runs automatically on boot.
+
+* `prune <id>` removes exactly one prunable record and its log (exact id first, unique prefix optional).
+* `prune all` removes all prunable records and logs.
+* bare `prune` remains compatible and behaves like `prune all`.
+* Prunable states: `stale`, `exited`, `failed`.
+* `running` records are not prunable.
 
 ### Kill command helper
 
@@ -163,7 +172,7 @@ Because the implementation uses persistent storage, records must include Linux `
 
 * `/proc/sys/kernel/random/boot_id`
 
-On `list/stop/kill`, if current `boot_id` differs from the record’s `boot_id`, the record is `stale` and `stop/kill` must refuse unless forced by implementation policy (no CLI flag is required by this spec; refusal is required).
+On `list/stop/kill/killcmd`, if current `boot_id` differs from the record’s `boot_id`, the record is `stale` and `stop/kill/killcmd` must refuse. Records/logs are preserved and remain visible until explicit prune.
 
 ### Record format
 
@@ -173,10 +182,16 @@ Required fields:
 
 * `version` (int)
 * `id` (string; 6–10 hex chars)
+* `run_id` (string; immutable concrete execution identifier)
 * `pid` (int) — leader PID at launch
 * `pgid` (int)
 * `sid` (int)
 * `start_unix_ns` (int64)
+* `ended_at_unix_ns` (int64, optional)
+* `state` (string)
+* `exit_code` (int, optional)
+* `term_signal` (int, optional)
+* `launch_error` (string, optional)
 * `argv` (array of strings)
 * `uid` (int)
 * `gid` (int)
@@ -251,6 +266,7 @@ A pipe is used to distinguish “exec succeeded” from “exec failed” withou
      * `stat("/proc/<pid>/exe")` to capture `(st_dev, st_ino)` when permitted.
      * If `/proc` reads return `ENOENT` (fast exit after exec), treat as non-fatal and write the record with missing identity fields set to 0.
    * Write record atomically.
+   * If record write fails after spawn, kill the spawned process group, reap the child, and return failure.
    * Print start output including id/pid/pgid/sid, log path, and stop command.
 
 ---
