@@ -1,5 +1,6 @@
 # Build output
 /sigmund
+/sigmund-dynamic
 
 # Prerequisites
 *.d
