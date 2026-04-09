@@ -54,19 +54,17 @@ Ctrl-C detaches from tailing — the background process keeps running.
 ### List
 
 ```
-sigmund -l
-sigmund --list
+sigmund list
 ```
 
 Lists run records and their status.
 
 Columns (stable):
 
-* `ID`
-* `PID`
-* `PGID`
-* `AGE`
-* `STATE` (`running`, `dead`, `stale`, `unknown`)
+* `RUNID`
+* `STATE` (`running`, `exited`, `stale`, `failed`, `unknown`)
+* `STARTED_AT` (RFC3339 UTC)
+* `RESULT` (`-`, `exit=<code>`, `signal=<sig>`, `launch=<reason>`)
 * `CMD` (truncated)
 
 ### Stop
@@ -107,9 +105,22 @@ Exit codes follow `stop`.
 
 ```
 sigmund prune
+sigmund prune <id>
+sigmund prune all
 ```
 
-Removes run records that are `dead`. Records in `stale` or `unknown` state are retained.
+* `sigmund prune`: backward-compatible cleanup of exited/failed records and orphan logs.
+* `sigmund prune <id>`: removes exactly one prunable run (`stale`, `exited`, `failed`) and associated output.
+* `sigmund prune all`: removes all prunable runs (`stale`, `exited`, `failed`) and associated output.
+* Running runs are never pruned.
+
+### Dump
+
+```
+sigmund dump <id>
+```
+
+Prints saved output for a run and exits. Works for stale runs when the log exists.
 
 ### Kill command helper
 
@@ -163,7 +174,7 @@ Because the implementation uses persistent storage, records must include Linux `
 
 * `/proc/sys/kernel/random/boot_id`
 
-On `list/stop/kill`, if current `boot_id` differs from the record’s `boot_id`, the record is `stale` and `stop/kill` must refuse unless forced by implementation policy (no CLI flag is required by this spec; refusal is required).
+On `list/stop/kill/killcmd`, if current `boot_id` differs from the record’s `boot_id`, the record is `stale` and signaling commands must refuse. Records/logs are not auto-deleted on boot change.
 
 ### Record format
 
@@ -173,6 +184,7 @@ Required fields:
 
 * `version` (int)
 * `id` (string; 6–10 hex chars)
+* `run_id` (string; equals `id` for this concrete execution)
 * `pid` (int) — leader PID at launch
 * `pgid` (int)
 * `sid` (int)
@@ -182,6 +194,12 @@ Required fields:
 * `gid` (int)
 * `log_path` (string)
 * `boot_id` (string; Linux; required when not using `$XDG_RUNTIME_DIR`)
+* `started_at` (string; RFC3339 UTC)
+* `ended_at` (string; optional)
+* `state` (string)
+* `exit_code` (int; optional)
+* `term_signal` (int; optional)
+* `launch_error` (string; optional)
 
 Linux identity fields (best-effort; required for “safe stop” when available):
 
@@ -300,7 +318,7 @@ For each record:
 * If leader PID is absent:
 
   * `kill(-pgid,0)` is `0`/`EPERM` → `running` (leader exited, group lives)
-  * `ESRCH` → `dead`
+  * `ESRCH` → `exited`
 * If validation cannot be performed (non-Linux without strong evidence), state is `unknown`.
 
 ---

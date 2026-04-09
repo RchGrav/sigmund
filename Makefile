@@ -12,10 +12,10 @@ sigmund: src/sigmund.c
 	$(CC) $(CFLAGS) $(VERSION_CPPFLAG) $(LDFLAGS) $(STATIC_LDFLAGS) -o $@ $<
 
 sigmund-dynamic: src/sigmund.c
-	$(CC) $(CFLAGS) $(VERSION_CPPFLAG) $(LDFLAGS) -o sigmund $<
+	$(CC) $(CFLAGS) $(VERSION_CPPFLAG) $(LDFLAGS) -o sigmund-dynamic $<
 
 clean:
-	rm -f sigmund
+	rm -f sigmund sigmund-dynamic
 
 .PHONY: all clean test
 

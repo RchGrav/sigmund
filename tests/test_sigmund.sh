@@ -76,7 +76,7 @@ test_lifecycle() {
   printf '%s\n' "$out" | grep -Eq "^sigmund: stop: sigmund stop $id$"
   "$SIGMUND_BIN" list | grep -Eq "^$id[[:space:]].*running"
   "$SIGMUND_BIN" stop "$id" >/dev/null
-  "$SIGMUND_BIN" list | grep -Eq "^$id[[:space:]].*dead"
+  "$SIGMUND_BIN" list | grep -Eq "^$id[[:space:]].*exited"
   "$SIGMUND_BIN" prune >/dev/null
   lines=$("$SIGMUND_BIN" list | wc -l)
   [ "$lines" -eq 1 ]
@@ -129,13 +129,13 @@ test_exec_failure_no_record() {
   [ "$count" -eq 0 ]
 }
 
-test_fast_exit_record_dead() {
+test_fast_exit_record_exited() {
   local out id
   out=$("$SIGMUND_BIN" true 2>&1) || return 1
   id=$(printf '%s\n' "$out" | extract_id)
   [ -n "$id" ] || return 1
   sleep 0.1
-  "$SIGMUND_BIN" list | grep -Eq "^$id[[:space:]].*dead"
+  "$SIGMUND_BIN" list | grep -Eq "^$id[[:space:]].*exited"
 }
 
 test_corrupt_record_handling() {
@@ -266,6 +266,85 @@ test_tail_verb_existing_id() {
   printf '%s\n' "$tailed" | grep -q 'from_tail_id'
 }
 
+test_persistent_stale_records() {
+  local out id store bootfile oldboot list_out stale_id stale_log
+  out=$("$SIGMUND_BIN" bash -c 'echo stale-line; sleep 0.2' 2>&1) || return 1
+  id=$(printf '%s\n' "$out" | extract_id)
+  [ -n "$id" ] || return 1
+  store="$HOME/.local/state/sigmund"
+  stale_log="$store/$id.log"
+  [ -f "$stale_log" ] || return 1
+  bootfile="$TEST_ROOT/fake_boot_id"
+  printf 'boot-a\n' >"$bootfile" || return 1
+  SIGMUND_BOOT_ID_PATH="$bootfile" "$SIGMUND_BIN" list >/dev/null || return 1
+  printf 'boot-b\n' >"$bootfile" || return 1
+  list_out=$(SIGMUND_BOOT_ID_PATH="$bootfile" "$SIGMUND_BIN" list) || return 1
+  printf '%s\n' "$list_out" | grep -Eq "^$id[[:space:]]+stale[[:space:]]"
+  set +e
+  SIGMUND_BOOT_ID_PATH="$bootfile" "$SIGMUND_BIN" stop "$id" >/dev/null 2>"$TEST_ROOT/stop.err"
+  [ "$?" -eq 2 ] || return 1
+  SIGMUND_BOOT_ID_PATH="$bootfile" "$SIGMUND_BIN" kill "$id" >/dev/null 2>"$TEST_ROOT/kill.err"
+  [ "$?" -eq 2 ] || return 1
+  SIGMUND_BOOT_ID_PATH="$bootfile" "$SIGMUND_BIN" killcmd "$id" >/dev/null 2>"$TEST_ROOT/killcmd.err"
+  [ "$?" -eq 2 ] || return 1
+  set -e
+  grep -q 'stale' "$TEST_ROOT/stop.err"
+  grep -q 'stale' "$TEST_ROOT/kill.err"
+  grep -q 'stale' "$TEST_ROOT/killcmd.err"
+  SIGMUND_BOOT_ID_PATH="$bootfile" "$SIGMUND_BIN" tail "$id" >"$TEST_ROOT/tail.out" 2>&1 || return 1
+  grep -q 'stale-line' "$TEST_ROOT/tail.out"
+  SIGMUND_BOOT_ID_PATH="$bootfile" "$SIGMUND_BIN" dump "$id" >"$TEST_ROOT/dump.out" 2>&1 || return 1
+  grep -q 'stale-line' "$TEST_ROOT/dump.out"
+  [ -f "$store/$id.json" ] && [ -f "$store/$id.log" ]
+}
+
+test_prune_by_id() {
+  local out1 out2 id1 id2 store
+  out1=$("$SIGMUND_BIN" true 2>&1) || return 1
+  out2=$("$SIGMUND_BIN" true 2>&1) || return 1
+  id1=$(printf '%s\n' "$out1" | extract_id)
+  id2=$(printf '%s\n' "$out2" | extract_id)
+  [ -n "$id1" ] && [ -n "$id2" ] || return 1
+  store="$HOME/.local/state/sigmund"
+  "$SIGMUND_BIN" prune "$id1" >/dev/null || return 1
+  [ ! -e "$store/$id1.json" ] && [ ! -e "$store/$id1.log" ] || return 1
+  [ -e "$store/$id2.json" ] && [ -e "$store/$id2.log" ]
+}
+
+test_prune_all_keeps_running() {
+  local out1 out2 id1 id2 store
+  out1=$("$SIGMUND_BIN" sleep 300 2>&1) || return 1
+  out2=$("$SIGMUND_BIN" true 2>&1) || return 1
+  id1=$(printf '%s\n' "$out1" | extract_id)
+  id2=$(printf '%s\n' "$out2" | extract_id)
+  [ -n "$id1" ] && [ -n "$id2" ] || return 1
+  store="$HOME/.local/state/sigmund"
+  "$SIGMUND_BIN" prune all >/dev/null || return 1
+  [ -e "$store/$id1.json" ] || return 1
+  [ ! -e "$store/$id2.json" ] || return 1
+  [ ! -e "$store/$id2.log" ] || return 1
+}
+
+test_transactional_record_write_failure() {
+  local rc pids
+  set +e
+  SIGMUND_TEST_FAIL_RECORD_WRITE=1 "$SIGMUND_BIN" bash -c 'exec -a sigmund_txn_test_sleep sleep 60' >/dev/null 2>&1
+  rc=$?
+  set -e
+  [ "$rc" -eq 1 ] || return 1
+  pids=$(pgrep -f 'sigmund_txn_test_sleep' || true)
+  [ -z "$pids" ]
+}
+
+test_build_artifact_coexistence() {
+  make clean >/dev/null || return 1
+  make sigmund >/dev/null || return 1
+  [ -x ./sigmund ] || return 1
+  make sigmund-dynamic >/dev/null || return 1
+  [ -x ./sigmund ] && [ -x ./sigmund-dynamic ] || return 1
+  [ -e ./sigmund ] && [ -e ./sigmund-dynamic ]
+}
+
 test_concurrent_unique_ids() {
   local i id ids uniq
   ids=""
@@ -288,7 +367,7 @@ run_test "kill subcommand kills process group" test_kill_subcommand
 run_test "start output includes stop helper" test_start_output_stop_hint
 run_test "stop kills full process group (children)" test_group_kill_children
 run_test "exec failure creates no record" test_exec_failure_no_record
-run_test "fast exit command is recorded as dead" test_fast_exit_record_dead
+run_test "fast exit command is recorded as exited" test_fast_exit_record_exited
 run_test "corrupt record warning and prune cleanup" test_corrupt_record_handling
 run_test "invalid pgid=0 record is not listed as running" test_invalid_pgid_record
 run_test "orphan logs are removed by prune" test_orphan_log_cleanup
@@ -299,6 +378,11 @@ run_test "argument edge cases" test_argument_edges
 run_test "special characters are preserved in argv JSON" test_special_chars_args
 run_test "logging captures stdout+stderr" test_log_capture
 run_test "tail <id> tails an existing run log" test_tail_verb_existing_id
+run_test "persistent stale records remain visible and dumpable" test_persistent_stale_records
+run_test "prune <id> removes exactly one run record/output" test_prune_by_id
+run_test "prune all removes prunable while preserving running" test_prune_all_keeps_running
+run_test "transactional launch rollback on record write failure" test_transactional_record_write_failure
+run_test "build artifacts for static and dynamic coexist" test_build_artifact_coexistence
 run_test "concurrent starts produce unique ids" test_concurrent_unique_ids
 
 if [ "$FAILS" -ne 0 ]; then
